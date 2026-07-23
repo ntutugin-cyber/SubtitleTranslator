@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.36310.24 d17.14
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SubtitleTranslator", "SubtitleTranslator.csproj", "{2EF2226D-C8C8-451B-A3EA-5A8058D6CFF7}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{2EF2226D-C8C8-451B-A3EA-5A8058D6CFF7}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2EF2226D-C8C8-451B-A3EA-5A8058D6CFF7}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2EF2226D-C8C8-451B-A3EA-5A8058D6CFF7}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2EF2226D-C8C8-451B-A3EA-5A8058D6CFF7}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {9C721773-09BB-4398-AA6D-421056708B46}
+	EndGlobalSection
+EndGlobal
