@@ -1,5 +1,6 @@
 ﻿using SubtitleTranslator.Models;
 using System;
+using System.IO;
 using System.Text.Json;
 using System.Windows;
 
@@ -59,31 +60,29 @@ namespace SubtitleTranslator.Services
             return ret;
         }
 
-        public static List<SubtitleItem>? getSubs(string jsonText)
+        public static List<SubtitleItem>? getSubs(string in_jsonText)
         {
             // Проверяем наличие метаданных перед JSON
-            if (jsonText.Contains("--- Результат распознавания ---"))
+            if (in_jsonText.Contains("--- Результат распознавания ---"))
             {
                 Logger.LogInfo("Обнаружены метаданные распознавания");
 
                 // Извлекаем и логируем метаданные
-                ParseAndLogMetadata(jsonText);
+                ParseAndLogMetadata(in_jsonText);
 
                 // Находим начало JSON (первая '[')
-                int jsonStartIndex = jsonText.IndexOf('[');
+                int jsonStartIndex = in_jsonText.IndexOf('[');
                 if (jsonStartIndex >= 0)
                 {
-                    jsonText = jsonText.Substring(jsonStartIndex);
+                    in_jsonText = in_jsonText.Substring(jsonStartIndex);
                     Logger.LogSuccess("Метаданные удалены, извлечён чистый JSON");
                 }
                 else
-                {
                     Logger.LogWarning("Не найдено начало JSON массива");
-                }
             }
 
             var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
-            List<SubtitleItem> subtitles = JsonSerializer.Deserialize<List<SubtitleItem>>(jsonText, options);
+            List<SubtitleItem> subtitles = JsonSerializer.Deserialize<List<SubtitleItem>>(in_jsonText, options);
             return subtitles;
         }
 
@@ -131,6 +130,33 @@ namespace SubtitleTranslator.Services
             catch (Exception ex)
             {
                 Logger.LogWarning($"Не удалось распарсить метаданные: {ex.Message}");
+            }
+        }
+
+        /// <summary> Попытаться удалить все файлы из указанной папки с указанным расширением </summary>
+        public static void tryDeleteFiles(string in_targetDirectory, string in_extention)
+        {
+            // Проверяем, существует ли указанная папка
+            if (!Directory.Exists(in_targetDirectory))
+            {
+                Logger.LogError($"Указанная папка не найдена: {in_targetDirectory}");
+                return;
+            }
+
+            try
+            {
+                // Находим все файлы .mp3 только в этой папке
+                string[] mp3Files = Directory.GetFiles(in_targetDirectory, in_extention, SearchOption.TopDirectoryOnly);
+
+                foreach (string file in mp3Files)
+                {
+                    File.Delete(file);
+                    //Logger.LogSuccess($"Удален файл: {Path.GetFileName(file)}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"Ошибка при удалении: {ex.Message}");
             }
         }
     }

@@ -257,8 +257,8 @@ namespace SubtitleTranslator.ViewModels
                     if (!await _translationService.CheckHealthAsync())
                     {
                         Logger.LogError($"Сервер перевода недоступен{Logger.getInfoDurationString(in_dateStart)}. Запустите: python server.py");
-                        MessageBox.Show("Сервер перевода недоступен.\nЗапустите: python server.py"
-                            , "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
+                        //MessageBox.Show("Сервер перевода недоступен.\nЗапустите: python server.py"
+                        //    , "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
                         StatusText = "Сервер недоступен";
                     }
 

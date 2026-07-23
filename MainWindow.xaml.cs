@@ -115,7 +115,7 @@ namespace SubtitleTranslator
             base.OnClosed(e);
         }
 
-        private void BrowseVideo_Click(object sender, RoutedEventArgs e)
+        private void BrowseVideo_Click(object in_sender, RoutedEventArgs in_e)
         {
             var dlg = new OpenFileDialog { Filter = "Video Files|*.mp4;*.mkv;*.avi" };
             if (dlg.ShowDialog() == true) TxtVideo.Text = dlg.FileName;
@@ -134,12 +134,11 @@ namespace SubtitleTranslator
             if (dlg.ShowDialog() == true) TxtMp3Folder.Text = dlg.FolderName;
         }
 
-        private List<SubtitleItem> ParseSrt(string path)
+        private List<SubtitleItem> parseSrt(string in_path)
         {
-            var blocks = new List<SubtitleItem>();
-            var lines = File.ReadAllLines(path);
+            var ret = new List<SubtitleItem>();
+            var lines = File.ReadAllLines(in_path);
             var timeRegex = new Regex(@"(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})");
-
             for (int i = 0; i < lines.Length; i++)
             {
                 var match = timeRegex.Match(lines[i]);
@@ -147,10 +146,11 @@ namespace SubtitleTranslator
                 {
                     var start = new TimeSpan(0, int.Parse(match.Groups[1].Value), int.Parse(match.Groups[2].Value), int.Parse(match.Groups[3].Value), int.Parse(match.Groups[4].Value));
                     var end = new TimeSpan(0, int.Parse(match.Groups[5].Value), int.Parse(match.Groups[6].Value), int.Parse(match.Groups[7].Value), int.Parse(match.Groups[8].Value));
-                    blocks.Add(new SubtitleItem { StartTime = start, EndTime = end });
+                    ret.Add(new SubtitleItem { StartTime = start, EndTime = end });
                 }
             }
-            return blocks;
+
+            return ret;
         }
 
         private string findFfprobe(string in_ffmpegPath)
@@ -179,16 +179,16 @@ namespace SubtitleTranslator
             return double.TryParse(outStr.Trim(), CultureInfo.InvariantCulture, out double dur) ? dur : 0;
         }
 
-        private string BuildFilterComplex(List<SubtitleItem> blocks, List<double> in_mp3Durations)
+        private string buildFilterComplex(List<SubtitleItem> in_blocks, List<double> in_mp3Durations)
         {
             var parts = new List<string> { "[0:a]volume=0.03[a_orig]" };
             var labels = new List<string>();
 
-            for (int i = 0; i < blocks.Count; i++)
+            for (int i = 0; i < in_blocks.Count; i++)
             {
-                double srtDur = (blocks[i].EndTime - blocks[i].StartTime).TotalSeconds;
+                double srtDur = (in_blocks[i].EndTime - in_blocks[i].StartTime).TotalSeconds;
                 double speed = in_mp3Durations[i] > srtDur ? Math.Min(1.3, in_mp3Durations[i] / srtDur) : 1.0;
-                int delayMs = (int)blocks[i].StartTime.TotalMilliseconds;
+                int delayMs = (int)in_blocks[i].StartTime.TotalMilliseconds;
                 string label = $"v{i}";
                 labels.Add(label);
                 parts.Add($"[{i + 1}:a]atempo={speed.ToString("0.00", CultureInfo.InvariantCulture)},adelay={delayMs}|{delayMs}[{label}]");
@@ -373,15 +373,21 @@ namespace SubtitleTranslator
 
         private async void onClickProcess(object sender, RoutedEventArgs e)
         {
-            var dateStart = DateTime.Now;
-            if (!ValidateInputs()) return;
+            if (!validateInputs()) return;
 
-            var ffmpegPath = TxtFfmpeg.Text.Trim();
             var videoPath = TxtVideo.Text.Trim();
             var srtPath = TxtSrt.Text.Trim();
-            var newFileName = $"{Path.GetFileNameWithoutExtension(srtPath)}.mp4";
             var mp3Folder = TxtMp3Folder.Text.Trim();
-            var outputPath = Path.Combine(Path.GetDirectoryName(videoPath) ?? "", newFileName);
+            var newFileName = $"{Path.GetFileNameWithoutExtension(srtPath)}.mp4";
+            var srtBlocks = parseSrt(srtPath);
+            await speakVideo(mp3Folder, videoPath, newFileName, srtBlocks);
+        }
+
+        private async Task speakVideo(string in_mp3Folder, string in_videoPath, string in_newFileName, List<SubtitleItem> in_srtBlocks)
+        {
+            var dateStart = DateTime.Now;
+            var outputPath = Path.Combine(Path.GetDirectoryName(in_videoPath) ?? "", in_newFileName);
+            var ffmpegPath = TxtFfmpeg.Text.Trim();
 
             _cts = new CancellationTokenSource();
             BtnStart.IsEnabled = false;
@@ -390,25 +396,24 @@ namespace SubtitleTranslator
 
             try
             {
-                var srtBlocks = ParseSrt(srtPath);
-                var mp3Files = new DirectoryInfo(mp3Folder)
+                var mp3Files = new DirectoryInfo(in_mp3Folder)
                    .GetFiles("*.mp3")
                    .OrderBy(f => f.LastWriteTime)       // Сортировка по дате изменения (по возрастанию)
                    .ThenBy(f => f.Name)                 // Вторичная сортировка по имени (на случай совпадающих дат)
                    .Select(f => f.FullName)
                    .ToArray();
 
-                if (mp3Files.Length != srtBlocks.Count)
-                    throw new Exception($"Количество MP3 ({mp3Files.Length}) не совпадает с блоками SRT ({srtBlocks.Count}). Файлы должны идти в порядке следования субтитров.");
+                if (mp3Files.Length != in_srtBlocks.Count)
+                    throw new Exception($"Количество MP3 ({mp3Files.Length}) не совпадает с блоками SRT ({in_srtBlocks.Count}). Файлы должны идти в порядке следования субтитров.");
 
                 var ffprobePath = findFfprobe(ffmpegPath);
                 var mp3Durations = new List<double>();
                 foreach (var mp3 in mp3Files)
                     mp3Durations.Add(await getDurationAsync(mp3, ffprobePath, _cts.Token));
 
-                double videoDuration = await getDurationAsync(videoPath, ffprobePath, _cts.Token);
-                string filterComplex = BuildFilterComplex(srtBlocks, mp3Durations);
-                var arguments = buildFfmpegArgs(videoPath, mp3Files, filterComplex, outputPath);
+                double videoDuration = await getDurationAsync(in_videoPath, ffprobePath, _cts.Token);
+                string filterComplex = buildFilterComplex(in_srtBlocks, mp3Durations);
+                var arguments = buildFfmpegArgs(in_videoPath, mp3Files, filterComplex, outputPath);
 
                 TxtStatus.Text = "Кодирование... (может занять время)";
                 PbProgress.IsIndeterminate = false;
@@ -436,7 +441,7 @@ namespace SubtitleTranslator
             }
         }
 
-        private bool ValidateInputs()
+        private bool validateInputs()
         {
             if (!File.Exists(TxtVideo.Text)) return ShowErr("Укажите корректный путь к видео.");
             if (!File.Exists(TxtSrt.Text)) return ShowErr("Укажите корректный путь к SRT.");
@@ -650,7 +655,8 @@ namespace SubtitleTranslator
                 return;
             }
 
-            m_voiceItems.Clear();
+            if (m_voiceItems.Any())
+                m_voiceItems.Clear();
 
             var random = new Random();
 
@@ -1018,24 +1024,24 @@ namespace SubtitleTranslator
             dgVoices.Items.Refresh();
         }
 
-        private Thread m_thParseSub;
-        private void onClickParseSub(object in_sender, RoutedEventArgs in_e)
+        private async void onClickParseSub(object in_sender, RoutedEventArgs in_e)
         {
-            m_thSpeaker = new Thread(() => parseSubtitle());
-            m_thSpeaker.Start();
+            await parseSubtitle();
         }
 
-        private async Task parseSubtitle(string in_firstPath = "", bool in_isSpeak = false)
+        private async Task parseSubtitle(string in_firstPath = "", bool in_isSpeak = false, List<SubtitleItem> subtitles = null)
         {
             var sw = Stopwatch.StartNew();
             try
             {
-                List<SubtitleItem>? subtitles = await getSubObjects();
+                if (subtitles == null)
+                    subtitles = await getSubObjects();
+
                 if (subtitles != null && subtitles.Count > 0)
                 {
                     Dictionary<string, Tuple<int, int>> psevdonims = getPsevdonimsFromSubObjects(subtitles);
                     if (in_isSpeak)
-                        speakMethod(in_firstPath, psevdonims, subtitles);
+                        await speakMethod(in_firstPath, psevdonims, subtitles);
                     else
                         fillVoiceItemsRandomly(psevdonims);
 
@@ -1091,6 +1097,7 @@ namespace SubtitleTranslator
 
         private async Task<List<SubtitleItem>?> getSubObjects()
         {
+            var ret = new List<SubtitleItem>();
             setStatus("Начали обработку субтиров");
             var dateStart = DateTime.Now;
             var subtitles = await m_rawJsonVM.getNormSub(dateStart);
@@ -1108,7 +1115,13 @@ namespace SubtitleTranslator
                 }
             }
 
-            return subtitles;
+            if (subtitles?.Any() == true)
+                foreach (var xsub in subtitles)
+                    if (!(m_rawJsonVM.IsNoRus && xsub.DetectedLang == "Русский")
+                                && !(!m_rawJsonVM.IncludeSounds && xsub.Content.StartsWith("[")))
+                        ret.Add(xsub);
+
+            return ret;
         }
 
         private void onClickSpeakSub(object in_sender, RoutedEventArgs in_e)
@@ -1154,6 +1167,39 @@ namespace SubtitleTranslator
                 m_thSpeaker.Start();
             }
             */
+        }
+
+        private void onClickSpeakVideo(object in_sender, RoutedEventArgs in_e)
+        {
+            var dlg = new OpenFileDialog { Filter = "Video Files|*.mp4;*.mkv;*.avi" };
+            if (dlg.ShowDialog() == true)
+            {
+                var mp4FilePath =  dlg.FileName;
+                speakVideo(mp4FilePath);
+            }
+        }
+
+        private async Task speakVideo(string in_videoPath)
+        {
+            var sw = Stopwatch.StartNew();
+
+            // Получаем путь к папке, где лежит исполняемый файл
+            string currentDir = AppDomain.CurrentDomain.BaseDirectory;
+
+            // Возвращаем путь к родительской папке получаем папку где будут храниться все субтитры
+            var subPath = Directory.GetParent(Directory.GetParent(currentDir)?.FullName)?.FullName;
+            subPath = Path.Combine(subPath, "subtitles");
+            Logger.tryDeleteFiles(subPath, "*.mp3");
+            Logger.tryDeleteFiles(subPath, "*.srt");
+            var subtitles = await getSubObjects();
+            await parseSubtitle(subPath, true, subtitles);
+            var newFileName = $"{Path.GetFileNameWithoutExtension(in_videoPath)} RusAudio.mp4";
+            await speakVideo(subPath, in_videoPath, newFileName, subtitles);
+
+            sw.Stop();
+            var mess = $"✅ Озвучено видео {newFileName} за {sw.Elapsed}.";
+            Logger.LogSuccess(mess);
+            setStatus(mess);
         }
     }
 }

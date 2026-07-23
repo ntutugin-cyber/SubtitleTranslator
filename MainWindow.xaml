@@ -520,6 +520,11 @@
                                     Click="onClickSetVoice"
                                     Content="Уст. гол."
                                     ToolTip="Установить выбранный голос на выбранный псевдоним" />
+                                <Button
+                                    Margin="5"
+                                    Click="onClickSpeakVideo"
+                                    Content="Озв. вид."
+                                    ToolTip="Озвучить видео с выбранными субтитрами и установленными голосами" />
                             </WrapPanel>
                         </GroupBox>
                     </Expander>
@@ -603,10 +608,6 @@
                                                 Binding="{Binding Psevdonim}"
                                                 Header="Псевдоним" />
                                             <DataGridTextColumn
-                                                Width="150"
-                                                Binding="{Binding Value}"
-                                                Header="Значение" />
-                                            <DataGridTextColumn
                                                 Width="80"
                                                 Binding="{Binding CountLinesText}"
                                                 Header="Строк" />
@@ -614,6 +615,10 @@
                                                 Width="100"
                                                 Binding="{Binding CountSymText}"
                                                 Header="Символов" />
+                                            <DataGridTextColumn
+                                                Width="150"
+                                                Binding="{Binding Value}"
+                                                Header="Значение" />
                                         </DataGrid.Columns>
                                     </DataGrid>
                                 </TabItem>
