@@ -68,20 +68,6 @@ namespace SubtitleTranslator.Models
             setLinkMessages();
         }
 
-        private void findParents()
-        {
-            for (var i = 0; i < m_tgMessages.Count; i++)
-                for (var j = i; j < m_tgMessages.Count; i++)
-                {
-                    var mess1 = m_tgMessages[i];
-                    var mess2 = m_tgMessages[j];
-                    if (mess2.MessageText.Contains(mess1.QuotedText))
-                    {
-
-                    }
-                }
-        }
-
         private void parseMessages(string in_input)
         {
             m_tgMessages = new List<TelegramMessage>();

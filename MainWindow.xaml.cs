@@ -560,77 +560,7 @@ namespace SubtitleTranslator
                     text = Regex.Replace(text, @"http\S+", "", RegexOptions.IgnoreCase);
                     m_telegramParser = new TelegramParser(text);
                     tbResultText.Text = m_telegramParser.getMyFormatText();
-
-                    //string[] rows = text.Split('\n', StringSplitOptions.RemoveEmptyEntries);
                     var psevdonims = m_telegramParser.getPsevdonims();
-                    /*
-                    var newText = "";
-                    var lastPsevdonim = "";
-                    foreach (var xrow in rows)
-                    {
-                        if (xrow.Contains(":"))
-                        {
-                            var psevdonim = "";
-                            var comments = "";
-                            var match = Regex.Match(xrow, @"\[.*?\] (.*?): ");
-                            if (match.Success && match.Groups.Count > 1)
-                            {
-                                psevdonim = normalizeText(match.Groups[1].Value);
-                                comments = Regex.Replace(xrow, @"\[.*?\] (.*?): ", "", RegexOptions.IgnoreCase);
-                            }
-                            else
-                                comments = xrow;
-
-                            comments = SubtitleManager.obrabotka(comments.Trim());
-                            comments = string.Join("\n", SubtitleManager.getSplittedText(comments));
-                            if (!string.IsNullOrWhiteSpace(comments))
-                            {
-                                var countSym = 0;
-                                var countBlock = 0;
-                                if (!string.IsNullOrWhiteSpace(psevdonim) || !string.IsNullOrWhiteSpace(lastPsevdonim))
-                                {
-                                    if (string.IsNullOrWhiteSpace(psevdonim))
-                                        psevdonim = lastPsevdonim;
-
-                                    if (psevdonims.ContainsKey(psevdonim))
-                                    {
-                                        var tuple = psevdonims[psevdonim];
-                                        countSym = tuple.Item1;
-                                        countBlock = tuple.Item2;
-                                        countSym += comments.Count();
-                                        countBlock += 1;
-                                        var newTuple = new Tuple<int, int>(countSym, countBlock);
-                                        psevdonims[psevdonim] = newTuple;
-                                    }
-                                    else
-                                    {
-                                        countSym += comments.Count();
-                                        countBlock += 1;
-                                        var newTuple = new Tuple<int, int>(countSym, countBlock);
-                                        psevdonims[psevdonim] = newTuple;
-                                    }
-
-                                    newText += $"{psevdonim}: {comments}\n";
-                                    if (!string.IsNullOrWhiteSpace(psevdonim))
-                                        lastPsevdonim = psevdonim;
-                                }
-                                else
-                                    newText += $"{comments}\n";
-                            }
-                        }
-                        else
-                        {
-                            var comments = SubtitleManager.obrabotka(xrow.Trim());
-                            if (!string.IsNullOrWhiteSpace(comments))
-                            {
-                                comments = string.Join("\n", SubtitleManager.getSplittedText(comments));
-                                newText += $"{comments}\n";
-                            }
-                        }
-                    }
-                    */
-
-                    //tbResultText.Text = newText;
                     fillVoiceItemsRandomly(psevdonims);
                     sw.Stop();
                     Logger.LogSuccess($"Распарсен текст из телеграмма за {sw.Elapsed}.");
@@ -711,7 +641,7 @@ namespace SubtitleTranslator
         private void onClickSpeakTgText(object in_sender, RoutedEventArgs in_e)
         {
             var text = tbResultText.Text.Trim();
-            if (!string.IsNullOrWhiteSpace(text))
+            if (!string.IsNullOrWhiteSpace(text) && m_telegramParser != null)
             {
                 var dlg = new SaveFileDialog
                 {
@@ -759,116 +689,115 @@ namespace SubtitleTranslator
                 var elapsedMilliseconds = new List<long>();
                 foreach (var xrow in rows)
                 {
-                    var psevdonim = "";
-                    var comments = "";
-                    if (xrow.Contains(":"))
+                    if (!string.IsNullOrWhiteSpace(xrow))
                     {
-                        psevdonim = xrow.Split(":")[0];
-                        comments = $"{xrow.Split(":")[1]}";
-                        if (string.IsNullOrWhiteSpace(psevdonim) && !string.IsNullOrWhiteSpace(lastPsevdonim))
-                            psevdonim = lastPsevdonim;
-                    }
-                    else
-                    {
-                        if (!string.IsNullOrWhiteSpace(lastPsevdonim))
-                            psevdonim = lastPsevdonim;
-
-                        comments = xrow;
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(psevdonim))
-                    {
-                        if (in_isNeedGlue)
-                            comments = $"{psevdonim}: {comments}";
-
-                        var voiceItem = m_voiceItems.Where(xi => xi.Psevdonim == psevdonim).FirstOrDefault();
-                        if (voiceItem != null)
+                        var partSw = Stopwatch.StartNew();
+                        var psevdonim = "";
+                        var comments = "";
+                        var startMessageMatch = Regex.Match(xrow, @"^\[.*\] (.*?): (.*?)$", RegexOptions.Singleline);
+                        if (startMessageMatch.Success)
                         {
-                            var outPath = Path.Combine(dir, $"{(index2):D3}_{baseName}.mp3");
-                            if (index < 2)
-                                outPath = Path.Combine(dir, $"{baseName}.mp3");
-
-                            var partSw = Stopwatch.StartNew();
-                            var isSuccess = false;
-                            var tryCount = 0;
-                            var errors = new HashSet<string>();
-                            while (!isSuccess && tryCount < 10)
-                            {
-                                try
-                                {
-                                    tryCount++;
-                                    await _api.SynthesizeToFileAsync(
-                                        input: comments,
-                                        voice: voiceItem.Value,
-                                        format: "mp3",
-                                        outputPath: outPath,
-                                        ct: _cts.Token);
-
-                                    index += 1;
-                                    partSw.Stop();
-                                    elapsedMilliseconds.Add(partSw.ElapsedMilliseconds);
-                                    if (elapsedMilliseconds.Count > 10)
-                                        elapsedMilliseconds.RemoveAt(0);
-
-                                    if (in_isNeedGlue && !string.IsNullOrWhiteSpace(outPath) && !string.IsNullOrWhiteSpace(lastOutPath)
-                                        && File.Exists(outPath) && File.Exists(lastOutPath))
-                                    {
-                                        // Сначала пытаемся склеить
-                                        AudioProcessor.processAudioFiles(lastOutPath, outPath);
-
-                                        // Если склеить не удалось (файл 002 всё ещё на месте) 
-                                        // И первый файл уже превышает лимит — организуем в папку
-                                        if (File.Exists(outPath))
-                                        {
-                                            //AudioProcessor.OrganizeFilesIfLimitExceeded(lastOutPath);
-                                            index2 += 1;
-                                            if (index2 == 2)
-                                            {
-                                                var tempOutPath = Path.Combine(dir, $"{(index2):D3}_{baseName}.mp3");
-                                                File.Move(outPath, tempOutPath);
-                                                File.Move(lastOutPath, outPath);
-                                                outPath = tempOutPath;
-                                                index2 += 1;
-                                            }
-
-                                            lastOutPath = outPath;
-                                        }
-                                        else
-                                        {
-                                            outPath = lastOutPath;
-                                            //index -= 1;
-                                        }
-                                    }
-
-                                    var avgMill = Convert.ToInt32(elapsedMilliseconds.Sum() / elapsedMilliseconds.Count);
-                                    var ostalosMilliseconds = (countAll - index) * avgMill;
-                                    var tmpOst = new TimeSpan(0, 0, 0, 0, ostalosMilliseconds);
-                                    var fileSize = getStrSizeFile(new FileInfo(outPath).Length);
-                                    var duration = AudioProcessor.getAudioDuration(outPath);
-                                    var percent = Math.Round(Convert.ToDouble(index) / (Convert.ToDouble(countAll) / 100.0), 3);
-                                    var outFileName = Path.GetFileNameWithoutExtension(outPath);
-                                    setStatus($"Часть {index} из {countAll} готова за {partSw.Elapsed}. Прошло {sw.Elapsed}, примерно осталось {tmpOst}. Прогресс: {percent}% Файл: {outFileName} ({duration} - {fileSize})", percent);
-                                    lastOutPath = outPath;
-                                    lastPsevdonim = psevdonim;
-                                    isSuccess = true;
-                                }
-                                catch (Exception ex)
-                                {
-                                    errors.Add(ex.Message);
-                                    setStatus($"Неудалось озвучить текст длинной {comments.Count()} с попытки {tryCount} из 10, голосом {voiceItem.Name} из за ошибки: {ex.Message}.");
-                                }
-
-                                Thread.Sleep(1000);
-                            }
-
-                            if (!isSuccess)
-                                Logger.LogError($"Неудалось озвучить текст длинной {comments.Count()} с 10 попыток, голосом {voiceItem.Name} из-за ошибок {string.Join('\n', errors)}");
+                            psevdonim = startMessageMatch.Groups[1].Value.Trim();
+                            comments = startMessageMatch.Groups[2].Value.Trim();
                         }
                         else
-                            Logger.LogError($"Ненайдено чем озвучивать псевдоним {voiceItem}");
+                        {
+                            psevdonim = lastPsevdonim;
+                            comments = xrow;
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(psevdonim))
+                        {
+                            if (in_isNeedGlue)
+                                comments = $"{psevdonim}: {comments}";
+
+                            var voiceItem = m_voiceItems.Where(xi => xi.Psevdonim == psevdonim).FirstOrDefault();
+                            if (voiceItem != null)
+                            {
+                                var outPath = System.IO.Path.Combine(dir, $"{(index2):D3}_{baseName}.mp3");
+                                if (index < 2)
+                                    outPath = System.IO.Path.Combine(dir, $"{baseName}.mp3");
+
+                                var isSuccess = false;
+                                var tryCount = 0;
+                                var errors = new HashSet<string>();
+                                while (!isSuccess && tryCount < 10)
+                                {
+                                    try
+                                    {
+                                        tryCount++;
+                                        await _api.SynthesizeToFileAsync(
+                                            input: comments,
+                                            voice: voiceItem.Value,
+                                            format: "mp3",
+                                            outputPath: outPath,
+                                            ct: _cts.Token);
+
+                                        index += 1;
+                                        if (in_isNeedGlue && !string.IsNullOrWhiteSpace(outPath) && !string.IsNullOrWhiteSpace(lastOutPath)
+                                            && File.Exists(outPath) && File.Exists(lastOutPath))
+                                        {
+                                            // Сначала пытаемся склеить
+                                            AudioProcessor.processAudioFiles(lastOutPath, outPath);
+
+                                            // Если склеить не удалось (файл 002 всё ещё на месте) 
+                                            // И первый файл уже превышает лимит — организуем в папку
+                                            if (File.Exists(outPath))
+                                            {
+                                                //AudioProcessor.OrganizeFilesIfLimitExceeded(lastOutPath);
+                                                index2 += 1;
+                                                if (index2 == 2)
+                                                {
+                                                    var tempOutPath = System.IO.Path.Combine(dir, $"{(index2):D3}_{baseName}.mp3");
+                                                    File.Move(outPath, tempOutPath);
+                                                    File.Move(lastOutPath, outPath);
+                                                    outPath = tempOutPath;
+                                                    index2 += 1;
+                                                }
+
+                                                lastOutPath = outPath;
+                                            }
+                                            else
+                                            {
+                                                outPath = lastOutPath;
+                                                //index -= 1;
+                                            }
+                                        }
+
+                                        partSw.Stop();
+                                        elapsedMilliseconds.Add(partSw.ElapsedMilliseconds);
+                                        if (elapsedMilliseconds.Count > 10)
+                                            elapsedMilliseconds.RemoveAt(0);
+                                        var avgMill = Convert.ToInt32(elapsedMilliseconds.Sum() / elapsedMilliseconds.Count);
+                                        var ostalosMilliseconds = (countAll - index) * avgMill;
+                                        var tmpOst = new TimeSpan(0, 0, 0, 0, ostalosMilliseconds);
+                                        var fileSize = getStrSizeFile(new FileInfo(outPath).Length);
+                                        var duration = AudioProcessor.getAudioDuration(outPath);
+                                        var percent = Math.Round(Convert.ToDouble(index) / (Convert.ToDouble(countAll) / 100.0), 3);
+                                        var outFileName = System.IO.Path.GetFileNameWithoutExtension(outPath);
+                                        setStatus($"Часть {index} из {countAll} готова за {partSw.Elapsed}. Прошло {sw.Elapsed}, примерно осталось {tmpOst}. Прогресс: {percent}% Файл: {outFileName} ({duration} - {fileSize})", percent);
+                                        lastOutPath = outPath;
+                                        lastPsevdonim = psevdonim;
+                                        isSuccess = true;
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        errors.Add(ex.Message);
+                                        setStatus($"Неудалось озвучить текст длинной {comments.Count()} с попытки {tryCount} из 10, голосом {voiceItem.Name} из за ошибки: {ex.Message}.");
+                                    }
+
+                                    Thread.Sleep(1000);
+                                }
+
+                                if (!isSuccess)
+                                    Logger.LogError($"Неудалось озвучить текст длинной {comments.Count()} с 10 попыток, голосом {voiceItem.Name} из-за ошибок {string.Join('\n', errors)}");
+                            }
+                            else
+                                Logger.LogError($"Ненайдено чем озвучивать псевдоним {voiceItem}");
+                        }
+                        else
+                            Logger.LogError($"Ненайден псевдоним");
                     }
-                    else
-                        Logger.LogError($"Ненайден псевдоним");
                 }
 
                 sw.Stop();
