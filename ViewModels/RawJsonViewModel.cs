@@ -284,6 +284,39 @@ namespace SubtitleTranslator.ViewModels
                         ret[i].EndTime = new TimeSpan(0, 0, Convert.ToInt32(Math.Round(ret[i].End)));
                     }
 
+                    RawJsonText = trySerializeSubJson(ret);
+
+                    StatusText = "Перевод завершён";
+                    Logger.LogSuccess($"Перевод завершён{Logger.getInfoDurationString(in_dateStart)}: {ret.Count} субтитров");
+                }
+            }
+
+            return ret;
+        }
+
+        public static List<SubtitleItem> tryDeserializeJsonSub(string in_jsonText)
+        {
+            var ret = new List<SubtitleItem>();
+            try
+            {
+                var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+                ret = JsonSerializer.Deserialize<List<SubtitleItem>>(in_jsonText, options);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"Неудалось распарсить Json для субтитров: {ex.Message}");
+            }
+
+            return ret;
+        }
+
+        public static string trySerializeSubJson(List<SubtitleItem> in_sub)
+        {
+            var ret = "";
+            if (in_sub?.Any() == true)
+            {
+                try
+                {
                     var options = new JsonSerializerOptions
                     {
                         PropertyNameCaseInsensitive = true,
@@ -293,10 +326,11 @@ namespace SubtitleTranslator.ViewModels
                     };
 
                     // Сериализуем
-                    RawJsonText = JsonSerializer.Serialize(ret, options);
-
-                    StatusText = "Перевод завершён";
-                    Logger.LogSuccess($"Перевод завершён{Logger.getInfoDurationString(in_dateStart)}: {ret.Count} субтитров");
+                    ret = JsonSerializer.Serialize(in_sub, options);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError($"Ошибка при сериализации субтитров: {ex.Message}");
                 }
             }
 

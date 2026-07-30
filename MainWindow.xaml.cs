@@ -1037,6 +1037,7 @@ namespace SubtitleTranslator
                 Logger.LogSuccess(mess);
 
                 var text = tbResultText.Text.Trim();
+                text = string.IsNullOrWhiteSpace(text) ? RawJsonTextBox.Text.Trim() : text;
                 if (!string.IsNullOrWhiteSpace(text))
                 {
                     var lines = Regex.Split(text, "[\r\n]").ToList();
@@ -1044,11 +1045,21 @@ namespace SubtitleTranslator
                 }
             }
 
+            SubtitleItem lastSubItem = null;
             if (subtitles?.Any() == true)
+            {
                 foreach (var xsub in subtitles)
                     if (!(m_rawJsonVM.IsNoRus && xsub.DetectedLang == "Русский")
                                 && !(!m_rawJsonVM.IncludeSounds && xsub.Content.StartsWith("[")))
+                    {
+                        if (lastSubItem == null)
+                            lastSubItem = xsub;
+
                         ret.Add(xsub);
+                    }
+
+                RawJsonTextBox.Text = RawJsonViewModel.trySerializeSubJson(subtitles);
+            }
 
             return ret;
         }
@@ -1072,30 +1083,6 @@ namespace SubtitleTranslator
             var firstPath = dlg.FileName;
             m_thSpeaker = new Thread(() => parseSubtitle(firstPath, true));
             m_thSpeaker.Start();
-
-            /*
-            var text = tbResultText.Text.Trim();
-            if (!string.IsNullOrWhiteSpace(text))
-            {
-                var dlg = new SaveFileDialog
-                {
-                    Filter = "MP3 файлы (*.mp3)|*.mp3",
-                    FileName = "speechText.mp3",
-                    Title = "Выберите имя и папку для первого файла (остальные сохранятся рядом)",
-                    DefaultExt = ".mp3"
-                };
-
-                if (dlg.ShowDialog() != true)
-                {
-                    Logger.LogInfo("Синтез отменён пользователем (диалог сохранения).");
-                    return;
-                }
-
-                var firstPath = dlg.FileName;
-                m_thSpeaker = new Thread(() => speakMethod(text, firstPath, false));
-                m_thSpeaker.Start();
-            }
-            */
         }
 
         private void onClickSpeakVideo(object in_sender, RoutedEventArgs in_e)

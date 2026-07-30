@@ -222,37 +222,100 @@ namespace SubtitleTranslator.Models
         {
             var ret = new List<SubtitleItem>();
             var currentBlock = new SubtitleItem();
+            var index = 0;
             for (int i = 0; i < in_lines.Count; i++)
             {
                 var line = in_lines[i].Trim();
-
                 if (int.TryParse(line, out _))
                 {
                     // Новый блок
-                    currentBlock.Content = SubtitleManager.obrabotka2(currentBlock.Content);
-                    if (currentBlock.Content != null)
+                    if (isContainText(currentBlock.Content))
                     {
-                        ret.Add(currentBlock);
-                        currentBlock = new SubtitleItem();
+                        currentBlock = fillSubItemContent(currentBlock);
+                        var messContent = Regex.Match(currentBlock.Content, @"[\.\!\?]$", RegexOptions.Singleline);
+                        if (messContent.Success)
+                        {
+                            index++;
+                            currentBlock.Index = index;
+                            ret.Add(currentBlock);
+                            currentBlock = new SubtitleItem();
+                        }
+                        else
+                            Console.WriteLine($"line = {line}");
                     }
+
                     currentBlock.Index = int.Parse(line);
                 }
                 else if (line.Contains(" --> "))
                 {
                     var times = line.Split(new[] { " --> " }, StringSplitOptions.None);
-                    currentBlock.StartTime = parseTime(times[0]);
+                    if (string.IsNullOrEmpty(currentBlock.Content))
+                    {
+                        currentBlock.StartTime = parseTime(times[0]);
+                        currentBlock.Start = currentBlock.StartTime.TotalSeconds;
+                    }
+
                     currentBlock.EndTime = parseTime(times[1]);
+                    currentBlock.End = currentBlock.EndTime.TotalSeconds;
                 }
                 else if (!string.IsNullOrEmpty(line))
                 {
-                    if (currentBlock.Content == null) currentBlock.Content = line.Trim();
-                    else currentBlock.Content += " " + line;
+                    var mesContent = line.Trim();
+                    var messContent = Regex.Match(mesContent, @"^Спикер (\d+): (.*?)$", RegexOptions.Singleline);
+                    if (messContent.Success)
+                    {
+                        var indSpeaker = currentBlock.Speaker;
+                        if (!int.TryParse(messContent.Groups[1].Value, out indSpeaker))
+                            Console.WriteLine($"Не удалось распарсить {messContent.Groups[1].Value}");
+                        else if (currentBlock.Speaker != indSpeaker)
+                            Console.WriteLine($"Не совпадают спикеры: currentBlock.Speaker = {currentBlock.Speaker} != indSpeaker = {indSpeaker}");
+
+                        currentBlock.Speaker = indSpeaker;
+                        mesContent = messContent.Groups[2].Value.Trim();
+                        mesContent = SubtitleManager.obrabotka2(mesContent);
+                    }
+
+                    if (isContainText(currentBlock.Content))
+                        currentBlock.Content += " " + mesContent;
+                    else if (isContainText(mesContent))
+                        currentBlock.Content = mesContent;
                 }
             }
 
             currentBlock.Content = SubtitleManager.obrabotka2(currentBlock.Content);
-            if (!string.IsNullOrWhiteSpace(currentBlock.Content))
+            if (isContainText(currentBlock.Content))
                 ret.Add(currentBlock);
+
+            return ret;
+        }
+
+        private static bool isContainText(string in_text)
+        {
+            var ret = false;
+            if (!string.IsNullOrWhiteSpace(in_text))
+            {
+                Match mt = Regex.Match(in_text, @"[\w\d]+", RegexOptions.Singleline);
+                ret = mt.Success;
+            }
+            
+            return ret;
+        }
+
+        private static SubtitleItem fillSubItemContent(SubtitleItem in_currentBlock)
+        {
+            var ret = in_currentBlock;
+            var messContent = Regex.Match(ret.Content, @"^Спикер (\d+): (.*?)$", RegexOptions.Singleline);
+            if (messContent.Success)
+            {
+                if (int.TryParse(messContent.Groups[1].Value, out var indSpeaker))
+                    ret.Speaker = indSpeaker;
+                else
+                    Console.WriteLine($"Не удалось распарсить {messContent.Groups[1].Value}");
+
+                ret.Content = messContent.Groups[1].Value;
+            }
+
+            ret.Content = SubtitleManager.obrabotka2(ret.Content);
 
             return ret;
         }
@@ -363,7 +426,6 @@ namespace SubtitleTranslator.Models
 
                 ret = Regex.Replace(ret, @"%", " процентов ", RegexOptions.IgnoreCase);
                 ret = Regex.Replace(ret, @"[\r\n]+", ". ", RegexOptions.IgnoreCase);
-                ret = Regex.Replace(ret, @"[^А-яЁёЬьЙйA-z0-9,.!?\-\—:<>]+", " ", RegexOptions.IgnoreCase);
                 ret = Regex.Replace(ret, @"[^\w\d<>]+([,.!?\-:])", "$1", RegexOptions.IgnoreCase);
                 ret = Regex.Replace(ret, @"([,.!?\-:])", "$1 ", RegexOptions.IgnoreCase);
                 ret = Regex.Replace(ret, @"\s+([,.!?\-:])", "$1", RegexOptions.IgnoreCase);

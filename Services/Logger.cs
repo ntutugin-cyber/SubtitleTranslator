@@ -1,7 +1,9 @@
 ﻿using SubtitleTranslator.Models;
+using SubtitleTranslator.ViewModels;
 using System;
 using System.IO;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Windows;
 
 namespace SubtitleTranslator.Services
@@ -81,9 +83,14 @@ namespace SubtitleTranslator.Services
                     Logger.LogWarning("Не найдено начало JSON массива");
             }
 
-            var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
-            List<SubtitleItem> subtitles = JsonSerializer.Deserialize<List<SubtitleItem>>(in_jsonText, options);
-            return subtitles;
+            var ret = RawJsonViewModel.tryDeserializeJsonSub(in_jsonText);
+            if (ret?.Any() != true && !string.IsNullOrWhiteSpace(in_jsonText))
+            {
+                var lines = Regex.Split(in_jsonText, "[\r\n]").ToList();
+                ret = SubtitleManager.parseFromLines(lines);
+            }
+
+            return ret;
         }
 
         private static void ParseAndLogMetadata(string text)
