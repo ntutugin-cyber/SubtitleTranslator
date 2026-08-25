@@ -18,6 +18,7 @@ using static System.Net.Mime.MediaTypeNames;
 using static System.Runtime.InteropServices.JavaScript.JSType;
 using System.Net.Http;
 using System.Text.Json;
+using System.Xml.Serialization;
 
 namespace SubtitleTranslator
 {
@@ -566,6 +567,20 @@ namespace SubtitleTranslator
                     _cts.Token
                 );
 
+                var tempDir = Path.Combine(
+                    Path.GetDirectoryName(in_videoPath) ?? Environment.CurrentDirectory,
+                    "vocal_removed"
+                );
+                if (Directory.Exists(tempDir))
+                    Directory.Delete(tempDir);
+
+                tempDir = Path.Combine(
+                    Path.GetDirectoryName(in_videoPath) ?? Environment.CurrentDirectory,
+                    "tempFiles"
+                );
+                if (Directory.Exists(tempDir))
+                    Directory.Delete(tempDir);
+
                 TxtStatus.Text = $"✅ Готово! Файл сохранён:\n{outputPath}";
                 Logger.LogSuccess($"Обработка успешно завершена{Logger.getInfoDurationString(dateStart)}");
             }
@@ -757,24 +772,30 @@ namespace SubtitleTranslator
                     obnul += 1;
                 }
 
-                // Выбираем случайный индекс
-                int randomIndex = random.Next(availableVoices.Count);
-                var randomVoice = availableVoices[randomIndex];
+                int randomIndex = -1;
+                var selectedVoice = availableVoices.FirstOrDefault(xi => xi.Name == psevdonim);
+                if (selectedVoice == null)
+                {
+                    // Выбираем случайный индекс
+                    randomIndex = random.Next(availableVoices.Count);
+                    selectedVoice = availableVoices[randomIndex];
+                }
 
                 // Создаём элемент
                 var item = new VoiceItem
                 {
                     Psevdonim = psevdonim,
-                    Name = randomVoice.Name,   // случайный голос
+                    Name = selectedVoice.Name,   // случайный голос
                     CountLinesText = in_psevdonims[psevdonim].Item2,
                     CountSymText = in_psevdonims[psevdonim].Item1,
-                    Value = randomVoice.Value
+                    Value = selectedVoice.Value
                 };
 
                 m_voiceItems.Add(item);
 
                 // Убираем выбранный голос из списка доступных, чтобы не повторять
-                availableVoices.RemoveAt(randomIndex);
+                if (randomIndex >= 0)
+                    availableVoices.RemoveAt(randomIndex);
             }
 
             var mess = $"Заполнено {m_voiceItems.Count} строк случайными голосами.";

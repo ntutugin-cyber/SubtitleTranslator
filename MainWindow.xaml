@@ -479,6 +479,10 @@
                                 Content="Не рус."
                                 IsChecked="{Binding IsNoRus}"
                                 ToolTip="Не переводить не озвучивать и не вставлять в субтитры русские фразы и блоки" />
+                            <CheckBox
+                                Content="Доставать голоса"
+                                IsChecked="{Binding IsNeedSpeakerVoice}"
+                                ToolTip="Нужно ли извлекать примеры голоса из видео и записывать их во временную папку рядом с видео с наименованиями Speaker 0, Speaker 1 и т. д." />
                         </StackPanel>
 
                         <!--  Кнопки  -->

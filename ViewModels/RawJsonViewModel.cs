@@ -26,6 +26,7 @@ namespace SubtitleTranslator.ViewModels
         private bool _noMoreThanTwo;
         private bool _noMoreThanTen;
         private bool _isProcessing;
+        private bool _isNeedSpeakerVoice;
         private string _statusText;
 
         public bool IsNoRus
@@ -88,6 +89,12 @@ namespace SubtitleTranslator.ViewModels
             set { _statusText = value; OnPropertyChanged(); }
         }
 
+        public bool IsNeedSpeakerVoice
+        {
+            get => _isNeedSpeakerVoice;
+            set { _isNeedSpeakerVoice = value; OnPropertyChanged(); }
+        }
+
         public ICommand ConvertToSubtitlesCommand { get; }
         public ICommand ConvertToTextCommand { get; }
         public ICommand ClearAllCommand { get; }
@@ -99,6 +106,7 @@ namespace SubtitleTranslator.ViewModels
             IncludeSpeakers = false;
             IncludeSounds = false;
             IsNoRus = true;
+            IsNeedSpeakerVoice = true;
             StatusText = "Готов к работе";
 
             ConvertToSubtitlesCommand = new RelayCommand(async _ => await ConvertToSubtitlesAsync(), _ => !IsProcessing && !string.IsNullOrWhiteSpace(RawJsonText));
@@ -122,6 +130,9 @@ namespace SubtitleTranslator.ViewModels
                 {
                     StatusText = $"Загружено {subtitles.Count} субтитров{Logger.getInfoDurationString(dateStart)} из JSON";
                     Logger.LogInfo(StatusText);
+
+                    if (IsNeedSpeakerVoice)
+                        await SpeakerAudioExtractor.createVoiceFile(subtitles);
 
                     var srt = new StringBuilder();
                     var num = 0;
@@ -182,6 +193,8 @@ namespace SubtitleTranslator.ViewModels
                 {
                     StatusText = $"Загружено {subtitles.Count} субтитров{Logger.getInfoDurationString(dateStart)} из JSON";
                     Logger.LogInfo(StatusText);
+                    if (IsNeedSpeakerVoice)
+                        await SpeakerAudioExtractor.createVoiceFile(subtitles);
 
                     var text = new StringBuilder();
                     foreach (var sub in subtitles)
