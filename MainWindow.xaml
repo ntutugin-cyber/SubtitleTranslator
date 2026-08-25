@@ -302,6 +302,52 @@
                             ToolTip="Если в PATH, оставьте ffmpeg.exe. Иначе укажите полный путь." />
                     </StackPanel>
 
+                    <StackPanel Grid.Row="5" Margin="0,8">
+                        <TextBlock Margin="0,2" Text="Аудио без вокала (.mp3)" />
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+
+                            <TextBox
+                                x:Name="TxtInstrumental"
+                                Grid.Column="0"
+                                Margin="4" />
+
+                            <Button
+                                Grid.Column="1"
+                                Margin="4"
+                                Click="BrowseInstrumental_Click"
+                                Content="📂" />
+
+                            <Button
+                                x:Name="BtnRemoveVocal"
+                                Grid.Column="2"
+                                Margin="4"
+                                Click="RemoveVocal_Click"
+                                Content="🎵 Удалить вокал" />
+                        </Grid>
+                    </StackPanel>
+
+                    <StackPanel
+                        Grid.Row="6"
+                        Margin="0,8"
+                        Orientation="Horizontal">
+                        <CheckBox
+                            x:Name="ChkUseInstrumentalOnSubtitles"
+                            Content="Использовать аудио без вокала на таймлайнах субтитров"
+                            IsChecked="True" />
+
+                        <CheckBox
+                            x:Name="ChkRequireGpuForVocal"
+                            Margin="20,0,0,0"
+                            Content="Требовать GPU"
+                            IsChecked="True"
+                            ToolTip="Если включено, сервер должен вернуть ошибку при отсутствии CUDA" />
+                    </StackPanel>
+
                     <!--  ИСПРАВЛЕНО: добавлено x:Name="BtnStart"  -->
                     <Button
                         x:Name="BtnStart"

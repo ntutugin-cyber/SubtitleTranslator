@@ -16,11 +16,20 @@ using System.Windows.Controls;
 using System.Xml.Linq;
 using static System.Net.Mime.MediaTypeNames;
 using static System.Runtime.InteropServices.JavaScript.JSType;
+using System.Net.Http;
+using System.Text.Json;
 
 namespace SubtitleTranslator
 {
     public partial class MainWindow : Window
     {
+        private static readonly HttpClient _vocalHttpClient = new HttpClient
+        {
+            Timeout = TimeSpan.FromHours(2)
+        };
+
+        private const string VocalRemoverEndpoint = "http://localhost:8000/remove-vocal";
+
         private readonly HiggsApiService _api = new();
         private CancellationTokenSource? _cts;
         private readonly Stopwatch _appStopwatch = Stopwatch.StartNew();
@@ -179,51 +188,134 @@ namespace SubtitleTranslator
             return double.TryParse(outStr.Trim(), CultureInfo.InvariantCulture, out double dur) ? dur : 0;
         }
 
-        private string buildFilterComplex(List<SubtitleItem> in_blocks, List<double> in_mp3Durations)
+        private string buildFilterComplex(
+		    List<SubtitleItem> in_blocks,
+		    List<double> in_mp3Durations,
+		    bool in_hasInstrumental)
         {
-            var parts = new List<string> { "[0:a]volume=0.03[a_orig]" };
+            var parts = new List<string>();
+
+            string timeline = buildTimelineExpression(in_blocks);
+
+            int voiceCount = Math.Min(in_blocks.Count, in_mp3Durations.Count);
+
+            if (in_hasInstrumental)
+            {
+                // Если есть озвучка, инструментал внутри субтитров делаем потише,
+                // чтобы голос был разборчивее.
+                // Если озвучки нет, оставляем почти полную громкость.
+                double instrumentalVolume = voiceCount > 0 ? 0.95 : 1;
+
+                // Оригинальная дорожка:
+                // внутри субтитров молчит, вне субтитров звучит как есть.
+                parts.Add($"[0:a]volume=0:enable='{timeline}'[a_orig_part]");
+
+                // Инструментал:
+                // вне субтитров молчит, внутри субтитров звучает.
+                parts.Add(
+                    $"[1:a]volume=0:enable='not({timeline})'," +
+                    $"volume={instrumentalVolume.ToString("0.00", CultureInfo.InvariantCulture)}:enable='{timeline}'" +
+                    $"[a_inst_part]"
+                );
+
+                // Смешиваем оригинал вне субтитров и инструментал внутри субтитров
+                parts.Add("[a_orig_part][a_inst_part]amix=inputs=2:duration=longest:normalize=0[a_bg]");
+            }
+            else
+            {
+                // Если инструментала нет, ведём себя близко к старой логике:
+                // оригинал тихо, если есть озвучка.
+                if (voiceCount == 0)
+                    parts.Add("[0:a]anull[a_bg]");
+                else
+                    parts.Add("[0:a]volume=0.03[a_bg]");
+            }
+
             var labels = new List<string>();
 
-            for (int i = 0; i < in_blocks.Count; i++)
+            // Если есть инструментал, он занимает вход 1,
+            // значит голосовые файлы начинаются со входа 2.
+            // Если инструментала нет, голосовые начинаются со входа 1.
+            int voiceInputStart = in_hasInstrumental ? 2 : 1;
+
+            for (int i = 0; i < voiceCount; i++)
             {
                 double srtDur = (in_blocks[i].EndTime - in_blocks[i].StartTime).TotalSeconds;
-                double speed = in_mp3Durations[i] > srtDur ? Math.Min(1.3, in_mp3Durations[i] / srtDur) : 1.0;
+
+                double speed = in_mp3Durations[i] > srtDur
+                    ? Math.Min(1.3, in_mp3Durations[i] / srtDur)
+                    : 1.0;
+
                 int delayMs = (int)in_blocks[i].StartTime.TotalMilliseconds;
                 string label = $"v{i}";
                 labels.Add(label);
-                parts.Add($"[{i + 1}:a]atempo={speed.ToString("0.00", CultureInfo.InvariantCulture)},adelay={delayMs}|{delayMs}[{label}]");
+                parts.Add(
+                    $"[{voiceInputStart + i}:a]" +
+                    $"atempo={speed.ToString("0.00", CultureInfo.InvariantCulture)}," +
+                    $"adelay={delayMs}|{delayMs}" +
+                    $"[{label}]"
+                );
             }
 
             if (labels.Count > 1)
             {
                 string inputs = string.Join("", labels.Select(l => $"[{l}]"));
                 parts.Add($"{inputs}amix=inputs={labels.Count}:duration=longest:normalize=0[a_voice]");
-                parts.Add("[a_orig][a_voice]amix=inputs=2:duration=longest:normalize=0[a_out]");
+                parts.Add("[a_bg][a_voice]amix=inputs=2:duration=longest:normalize=0[a_out]");
             }
             else if (labels.Count == 1)
-            {
-                parts.Add($"[a_orig][{labels[0]}]amix=inputs=2:duration=longest:normalize=0[a_out]");
-            }
+                parts.Add($"[a_bg][{labels[0]}]amix=inputs=2:duration=longest:normalize=0[a_out]");
             else
-            {
-                parts.Add("[a_orig]anull[a_out]");
-            }
+                parts.Add("[a_bg]anull[a_out]");
 
             return string.Join(";", parts);
         }
 
-        private List<string> buildFfmpegArgs(string in_video, string[] in_mp3s, string in_filter, string in_output)
+        private List<string> buildFfmpegArgs(
+            string in_video,
+            string[] in_mp3s,
+            string in_filter,
+            string in_output,
+            string in_instrumentalPath = null)
         {
             var args = new List<string> { "-y" };
-            args.Add("-i"); args.Add(in_video);
-            foreach (var mp3 in in_mp3s) { args.Add("-i"); args.Add(mp3); }
 
-            args.Add("-filter_complex"); args.Add(in_filter);
-            args.Add("-map"); args.Add("0:v");
-            args.Add("-map"); args.Add("[a_out]");
-            args.Add("-c:v"); args.Add("copy");
-            args.Add("-c:a"); args.Add("aac");
-            args.Add("-b:a"); args.Add("192k");
+            // Вход 0: оригинальное видео
+            args.Add("-i");
+            args.Add(in_video);
+
+            // Вход 1: аудио без вокала, если есть
+            if (!string.IsNullOrWhiteSpace(in_instrumentalPath))
+            {
+                args.Add("-i");
+                args.Add(in_instrumentalPath);
+            }
+
+            // Далее идут голосовые MP3
+            foreach (var mp3 in in_mp3s)
+            {
+                args.Add("-i");
+                args.Add(mp3);
+            }
+
+            args.Add("-filter_complex");
+            args.Add(in_filter);
+
+            args.Add("-map");
+            args.Add("0:v");
+
+            args.Add("-map");
+            args.Add("[a_out]");
+
+            args.Add("-c:v");
+            args.Add("copy");
+
+            args.Add("-c:a");
+            args.Add("aac");
+
+            args.Add("-b:a");
+            args.Add("192k");
+
             args.Add(in_output);
             return args;
         }
@@ -373,20 +465,42 @@ namespace SubtitleTranslator
 
         private async void onClickProcess(object sender, RoutedEventArgs e)
         {
-            if (!validateInputs()) return;
+            if (!validateInputs())
+                return;
 
             var videoPath = TxtVideo.Text.Trim();
             var srtPath = TxtSrt.Text.Trim();
             var mp3Folder = TxtMp3Folder.Text.Trim();
-            var newFileName = $"{Path.GetFileNameWithoutExtension(srtPath)}.mp4";
+            var newFileName = $"{Path.GetFileNameWithoutExtension(srtPath)}_newFileWithAudioSpeak.mp4";
             var srtBlocks = parseSrt(srtPath);
-            await speakVideo(mp3Folder, videoPath, newFileName, srtBlocks);
+
+            string instrumentalPath = ChkUseInstrumentalOnSubtitles.IsChecked == true
+                ? TxtInstrumental.Text.Trim()
+                : null;
+
+            await speakVideo(
+                mp3Folder,
+                videoPath,
+                newFileName,
+                srtBlocks,
+                instrumentalPath
+            );
         }
 
-        private async Task speakVideo(string in_mp3Folder, string in_videoPath, string in_newFileName, List<SubtitleItem> in_srtBlocks)
+        private async Task speakVideo(
+            string in_mp3Folder,
+            string in_videoPath,
+            string in_newFileName,
+            List<SubtitleItem> in_srtBlocks,
+            string in_instrumentalPath = null)
         {
             var dateStart = DateTime.Now;
-            var outputPath = Path.Combine(Path.GetDirectoryName(in_videoPath) ?? "", in_newFileName);
+
+            var outputPath = Path.Combine(
+                Path.GetDirectoryName(in_videoPath) ?? "",
+                in_newFileName
+            );
+
             var ffmpegPath = TxtFfmpeg.Text.Trim();
 
             _cts = new CancellationTokenSource();
@@ -397,31 +511,63 @@ namespace SubtitleTranslator
             try
             {
                 var mp3Files = new DirectoryInfo(in_mp3Folder)
-                   .GetFiles("*.mp3")
-                   .OrderBy(f => f.LastWriteTime)       // Сортировка по дате изменения (по возрастанию)
-                   .ThenBy(f => f.Name)                 // Вторичная сортировка по имени (на случай совпадающих дат)
-                   .Select(f => f.FullName)
-                   .ToArray();
+                    .GetFiles("*.mp3")
+                    .OrderBy(f => f.LastWriteTime) // Сортировка по дате изменения (по возрастанию)
+                    .ThenBy(f => f.Name) // Вторичная сортировка по имени (на случай совпадающих дат)
+                    .Select(f => f.FullName)
+                    .ToArray();
 
-                if (mp3Files.Length != in_srtBlocks.Count)
-                    throw new Exception($"Количество MP3 ({mp3Files.Length}) не совпадает с блоками SRT ({in_srtBlocks.Count}). Файлы должны идти в порядке следования субтитров.");
+                // Если файлов озвучки нет — разрешаем сделать только фон.
+                // Если файлы есть, их количество должно совпадать с блоками субтитров.
+                if (mp3Files.Length > 0 && mp3Files.Length != in_srtBlocks.Count)
+                {
+                    throw new Exception(
+                        $"Количество MP3 ({mp3Files.Length}) не совпадает с блоками SRT ({in_srtBlocks.Count}). " +
+                        "Файлы должны идти в порядке следования субтитров."
+                    );
+                }
+
+                bool hasInstrumental =
+                    !string.IsNullOrWhiteSpace(in_instrumentalPath) &&
+                    File.Exists(in_instrumentalPath);
 
                 var ffprobePath = findFfprobe(ffmpegPath);
+
                 var mp3Durations = new List<double>();
+
                 foreach (var mp3 in mp3Files)
+                {
                     mp3Durations.Add(await getDurationAsync(mp3, ffprobePath, _cts.Token));
+                }
 
                 double videoDuration = await getDurationAsync(in_videoPath, ffprobePath, _cts.Token);
-                string filterComplex = buildFilterComplex(in_srtBlocks, mp3Durations);
-                var arguments = buildFfmpegArgs(in_videoPath, mp3Files, filterComplex, outputPath);
+
+                string filterComplex = buildFilterComplex(
+                    in_srtBlocks,
+                    mp3Durations,
+                    hasInstrumental
+                );
+
+                var arguments = buildFfmpegArgs(
+                    in_videoPath,
+                    mp3Files,
+                    filterComplex,
+                    outputPath,
+                    hasInstrumental ? in_instrumentalPath : null
+                );
 
                 TxtStatus.Text = "Кодирование... (может занять время)";
                 PbProgress.IsIndeterminate = false;
-                await runFfmpegAsync(ffmpegPath, arguments, videoDuration, _cts.Token);
+
+                await runFfmpegAsync(
+                    ffmpegPath,
+                    arguments,
+                    videoDuration,
+                    _cts.Token
+                );
 
                 TxtStatus.Text = $"✅ Готово! Файл сохранён:\n{outputPath}";
                 Logger.LogSuccess($"Обработка успешно завершена{Logger.getInfoDurationString(dateStart)}");
-                //MessageBox.Show("Обработка успешно завершена!", "Готово", MessageBoxButton.OK, MessageBoxImage.Information);
             }
             catch (OperationCanceledException)
             {
@@ -431,7 +577,6 @@ namespace SubtitleTranslator
             catch (Exception ex)
             {
                 TxtStatus.Text = $"❌ Ошибка: {ex.Message}";
-                //MessageBox.Show(ex.Message, "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
                 Logger.LogSuccess($"❌ Ошибка{Logger.getInfoDurationString(dateStart)}: {ex.Message}");
             }
             finally
@@ -459,6 +604,12 @@ namespace SubtitleTranslator
                 }
                 catch { return ShowErr("ffmpeg.exe не найден. Укажите полный путь к файлу или добавьте его в PATH."); }
             }
+
+            if (!string.IsNullOrWhiteSpace(TxtInstrumental.Text) && !File.Exists(TxtInstrumental.Text.Trim()))
+            {
+                return ShowErr("Указанный файл аудио без вокала не найден.");
+            }
+
             return true;
         }
 
@@ -507,6 +658,7 @@ namespace SubtitleTranslator
             {
                 _api.Configure(tbApiUrl.Text.Trim().TrimEnd('/'), tbApiKey.Text.Trim());
                 var speakers = await _api.GetSpeakersAsync();
+                m_voiceAllItems.Clear();
                 m_voiceAllItems.Add(new() { Name = "🎤 Default (стандартный)", Value = "default" });
                 foreach (var xid in speakers.Keys)
                 {
@@ -1058,7 +1210,11 @@ namespace SubtitleTranslator
                         ret.Add(xsub);
                     }
 
-                RawJsonTextBox.Text = RawJsonViewModel.trySerializeSubJson(subtitles);
+                var jsonRawText = RawJsonViewModel.trySerializeSubJson(subtitles);
+                Dispatcher.BeginInvoke(() =>
+                {
+                    RawJsonTextBox.Text = jsonRawText;
+                });
             }
 
             return ret;
@@ -1110,12 +1266,235 @@ namespace SubtitleTranslator
             var subtitles = await getSubObjects();
             await parseSubtitle(subPath, true, subtitles);
             var newFileName = $"{Path.GetFileNameWithoutExtension(in_videoPath)} RusAudio.mp4";
-            await speakVideo(subPath, in_videoPath, newFileName, subtitles);
+            string instrumentalPath = ChkUseInstrumentalOnSubtitles.IsChecked == true
+                    ? TxtInstrumental.Text.Trim()
+                    : null;
+
+            await speakVideo(
+                subPath,
+                in_videoPath,
+                newFileName,
+                subtitles,
+                instrumentalPath
+            );
 
             sw.Stop();
             var mess = $"✅ Озвучено видео {newFileName} за {sw.Elapsed}.";
             Logger.LogSuccess(mess);
             setStatus(mess);
+        }
+
+        private void BrowseInstrumental_Click(object sender, RoutedEventArgs e)
+        {
+            var dlg = new OpenFileDialog
+            {
+                Filter = "Audio Files|*.mp3;*.wav|MP3|*.mp3|WAV|*.wav"
+            };
+
+            if (dlg.ShowDialog() == true)
+            {
+                TxtInstrumental.Text = dlg.FileName;
+            }
+        }
+
+        private async void RemoveVocal_Click(object sender, RoutedEventArgs e)
+        {
+            var sw = Stopwatch.StartNew();
+            var videoPath = TxtVideo.Text.Trim();
+
+            if (!File.Exists(videoPath))
+            {
+                sw.Stop();
+                ShowErr("Сначала выберите существующий видеофайл *.mp4.");
+                return;
+            }
+
+            try
+            {
+                BtnRemoveVocal.IsEnabled = false;
+
+                var outputDir = Path.Combine(
+                    Path.GetDirectoryName(videoPath) ?? Environment.CurrentDirectory,
+                    "vocal_removed"
+                );
+
+                Directory.CreateDirectory(outputDir);
+
+                TxtStatus.Text = "🎵 Удаление вокала через сервер... Это может занять несколько минут.";
+                PbProgress.IsIndeterminate = true;
+                PbProgress.Visibility = Visibility.Visible;
+
+                var requireGpu = ChkRequireGpuForVocal.IsChecked == true;
+
+                var mp3Path = await removeVocalViaServerAsync(
+                    videoPath,
+                    outputDir,
+                    requireGpu,
+                    CancellationToken.None
+                );
+
+                TxtInstrumental.Text = mp3Path;
+                ChkUseInstrumentalOnSubtitles.IsChecked = true;
+
+                sw.Stop();
+                TxtStatus.Text = $"✅ Аудио без вокала создано за {sw.Elapsed}: {mp3Path}";
+                Logger.LogSuccess($"Удаление вокала завершено за {sw.Elapsed}: {mp3Path}");
+            }
+            catch (Exception ex)
+            {
+                sw.Stop();
+                TxtStatus.Text = $"❌ Ошибка удаления вокала за {sw.Elapsed}: {ex.Message}";
+                Logger.LogError($"Ошибка удаления вокала за {sw.Elapsed}: {ex.Message}");
+
+                MessageBox.Show(
+                    ex.Message,
+                    $"Ошибка удаления вокала за {sw.Elapsed}",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error
+                );
+            }
+            finally
+            {
+                BtnRemoveVocal.IsEnabled = true;
+                PbProgress.IsIndeterminate = false;
+                PbProgress.Visibility = Visibility.Collapsed;
+            }
+        }
+
+        private async Task<string> removeVocalViaServerAsync(
+            string in_videoPath,
+            string in_outputDir,
+            bool in_requireGpu,
+            CancellationToken in_ct)
+        {
+            var payload = new
+            {
+                video_path = Path.GetFullPath(in_videoPath),
+                output_dir = Path.GetFullPath(in_outputDir),
+                delete_wav_after_mp3 = true,
+                require_gpu = in_requireGpu
+            };
+
+            string json = JsonSerializer.Serialize(payload);
+
+            using (var content = new StringContent(json, Encoding.UTF8, "application/json"))
+            {
+                using (var response = await _vocalHttpClient.PostAsync(VocalRemoverEndpoint, content, in_ct))
+                {
+                    string text = await response.Content.ReadAsStringAsync();
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        string errorMessage = $"HTTP {(int)response.StatusCode}";
+
+                        try
+                        {
+                            using (var errorDoc = JsonDocument.Parse(text))
+                            {
+                                if (errorDoc.RootElement.TryGetProperty("detail", out var detailProp))
+                                {
+                                    errorMessage += Environment.NewLine + detailProp.ToString();
+                                }
+                                else
+                                {
+                                    errorMessage += Environment.NewLine + text;
+                                }
+                            }
+                        }
+                        catch
+                        {
+                            errorMessage += Environment.NewLine + text;
+                        }
+
+                        throw new Exception(errorMessage);
+                    }
+
+                    using (var doc = JsonDocument.Parse(text))
+                    {
+                        var root = doc.RootElement;
+
+                        if (!root.TryGetProperty("success", out var successProp))
+                        {
+                            throw new Exception($"Сервер вернул некорректный ответ: {text}");
+                        }
+
+                        bool isSuccess =
+                            successProp.ValueKind == JsonValueKind.True ||
+                            (successProp.ValueKind == JsonValueKind.String &&
+                             successProp.GetString()?.ToLower() == "true");
+
+                        if (!isSuccess)
+                        {
+                            string detail = text;
+
+                            if (root.TryGetProperty("detail", out var detailProp))
+                            {
+                                detail = detailProp.ToString();
+                            }
+                            else if (root.TryGetProperty("message", out var messageProp))
+                            {
+                                detail = messageProp.ToString();
+                            }
+
+                            throw new Exception(detail);
+                        }
+
+                        string resultPath = null;
+
+                        // Основной вариант — сервер уже вернул MP3
+                        if (root.TryGetProperty("no_vocal_mp3_path", out var mp3Prop))
+                        {
+                            resultPath = mp3Prop.GetString();
+                        }
+
+                        // Запасной вариант — если сервер старый и вернул WAV/путь к инструменталу
+                        if (string.IsNullOrWhiteSpace(resultPath) &&
+                            root.TryGetProperty("instrumental_path", out var instrumentalProp))
+                        {
+                            resultPath = instrumentalProp.GetString();
+                        }
+
+                        if (string.IsNullOrWhiteSpace(resultPath))
+                        {
+                            throw new Exception(
+                                "Сервер завершил работу, но не вернул путь к аудио без вокала. " +
+                                $"Ответ: {text}"
+                            );
+                        }
+
+                        if (!Path.IsPathRooted(resultPath))
+                        {
+                            resultPath = Path.GetFullPath(resultPath);
+                        }
+
+                        return resultPath;
+                    }
+                }
+            }
+        }
+
+        private string buildTimelineExpression(List<SubtitleItem> in_blocks)
+        {
+            if (in_blocks == null || in_blocks.Count == 0)
+                return "0";
+
+            var parts = new List<string>();
+
+            foreach (var block in in_blocks)
+            {
+                double start = Math.Max(0, block.StartTime.TotalSeconds);
+                double end = block.EndTime.TotalSeconds;
+
+                if (end <= start)
+                    end = start + 0.1;
+
+                parts.Add(
+                    $"between(t,{start.ToString("0.000", CultureInfo.InvariantCulture)}," +
+                    $"{end.ToString("0.000", CultureInfo.InvariantCulture)})"
+                );
+            }
+
+            return string.Join("+", parts);
         }
     }
 }
