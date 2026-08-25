@@ -1265,6 +1265,7 @@ namespace SubtitleTranslator
             Logger.tryDeleteFiles(subPath, "*.srt");
             var subtitles = await getSubObjects();
             await parseSubtitle(subPath, true, subtitles);
+            await removeVocal(in_videoPath);
             var newFileName = $"{Path.GetFileNameWithoutExtension(in_videoPath)} RusAudio.mp4";
             string instrumentalPath = ChkUseInstrumentalOnSubtitles.IsChecked == true
                     ? TxtInstrumental.Text.Trim()
@@ -1299,14 +1300,19 @@ namespace SubtitleTranslator
 
         private async void RemoveVocal_Click(object sender, RoutedEventArgs e)
         {
-            var sw = Stopwatch.StartNew();
             var videoPath = TxtVideo.Text.Trim();
+            await removeVocal(videoPath);
+        }
 
-            if (!File.Exists(videoPath))
+        private async Task<bool> removeVocal(string in_videoPath)
+        {
+            var ret = false;
+            var sw = Stopwatch.StartNew();
+            if (!File.Exists(in_videoPath))
             {
                 sw.Stop();
                 ShowErr("Сначала выберите существующий видеофайл *.mp4.");
-                return;
+                return false;
             }
 
             try
@@ -1314,7 +1320,7 @@ namespace SubtitleTranslator
                 BtnRemoveVocal.IsEnabled = false;
 
                 var outputDir = Path.Combine(
-                    Path.GetDirectoryName(videoPath) ?? Environment.CurrentDirectory,
+                    Path.GetDirectoryName(in_videoPath) ?? Environment.CurrentDirectory,
                     "vocal_removed"
                 );
 
@@ -1327,7 +1333,7 @@ namespace SubtitleTranslator
                 var requireGpu = ChkRequireGpuForVocal.IsChecked == true;
 
                 var mp3Path = await removeVocalViaServerAsync(
-                    videoPath,
+                    in_videoPath,
                     outputDir,
                     requireGpu,
                     CancellationToken.None
@@ -1335,6 +1341,7 @@ namespace SubtitleTranslator
 
                 TxtInstrumental.Text = mp3Path;
                 ChkUseInstrumentalOnSubtitles.IsChecked = true;
+                ret = true;
 
                 sw.Stop();
                 TxtStatus.Text = $"✅ Аудио без вокала создано за {sw.Elapsed}: {mp3Path}";
@@ -1359,6 +1366,8 @@ namespace SubtitleTranslator
                 PbProgress.IsIndeterminate = false;
                 PbProgress.Visibility = Visibility.Collapsed;
             }
+
+            return ret;
         }
 
         private async Task<string> removeVocalViaServerAsync(
