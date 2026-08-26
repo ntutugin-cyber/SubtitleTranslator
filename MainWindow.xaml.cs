@@ -567,19 +567,7 @@ namespace SubtitleTranslator
                     _cts.Token
                 );
 
-                var tempDir = Path.Combine(
-                    Path.GetDirectoryName(in_videoPath) ?? Environment.CurrentDirectory,
-                    "vocal_removed"
-                );
-                if (Directory.Exists(tempDir))
-                    Directory.Delete(tempDir);
-
-                tempDir = Path.Combine(
-                    Path.GetDirectoryName(in_videoPath) ?? Environment.CurrentDirectory,
-                    "tempFiles"
-                );
-                if (Directory.Exists(tempDir))
-                    Directory.Delete(tempDir);
+                clearCache(in_videoPath);
 
                 TxtStatus.Text = $"✅ Готово! Файл сохранён:\n{outputPath}";
                 Logger.LogSuccess($"Обработка успешно завершена{Logger.getInfoDurationString(dateStart)}");
@@ -598,6 +586,28 @@ namespace SubtitleTranslator
             {
                 BtnStart.IsEnabled = true;
                 PbProgress.IsIndeterminate = false;
+            }
+        }
+
+        private static void clearCache(string in_videoPath)
+        {
+            try
+            {
+                var cacheCirections = new List<string>() { "vocal_removed", "tempFiles" };
+                foreach (var xDirectionName in cacheCirections)
+                {
+                    var tempDir = Path.Combine(
+                        Path.GetDirectoryName(in_videoPath) ?? Environment.CurrentDirectory,
+                        xDirectionName
+                    );
+
+                    if (Directory.Exists(tempDir))
+                        Directory.Delete(tempDir, true);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"Ошибка при удалении папок кэша: {ex.Message}");
             }
         }
 
