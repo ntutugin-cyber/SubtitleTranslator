@@ -16,6 +16,7 @@ from smart_translator import SmartTranslator
 
 # Глобальный переводчик
 translator: Optional[SmartTranslator] = None
+translate_lock = Lock()
 
 def check_and_install_packages():
     packages = {
@@ -132,95 +133,116 @@ async def health_check():
         "device": "GPU" if translator and getattr(translator, "device", None) == 0 else "CPU",
     }
 
+def _translate_one(text: str, src_lang: Optional[str]) -> TranslateResponse:
+    detected_lang, detected_lang_name = translator.detect_language(text)
+    translated = translator.translate(text, src_lang)
+
+    return TranslateResponse(
+        translated_text=translated,
+        detected_lang=detected_lang,
+        detected_lang_name=detected_lang_name
+    )
+
+
 @app.post("/translate", response_model=TranslateResponse)
-async def translate(request: TranslateRequest):
+def translate(request: TranslateRequest):
     """Перевод одного текста"""
     if not translator:
         raise HTTPException(status_code=503, detail="Модель не загружена")
-    
+
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="Текст не может быть пустым")
-    
+
     try:
         start_time = time.time()
-        
-        # Определяем язык
-        detected_lang, detected_lang_name = translator.detect_language(request.text)
-        
-        # Переводим
-        translated = translator.translate(request.text, request.src_lang)
-        
+
+        with translate_lock:
+            result = _translate_one(request.text, request.src_lang)
+
         elapsed = time.time() - start_time
-        print(f"✅ Перевод за {elapsed:.2f}с: [{detected_lang_name}] → Русский")
-        
-        return TranslateResponse(
-            translated_text=translated,
-            detected_lang=detected_lang,
-            detected_lang_name=detected_lang_name
+        print(
+            f"✅ Перевод за {elapsed:.2f}с: "
+            f"[{result.detected_lang_name}] → Русский"
         )
-    
+
+        return result
+
+    except HTTPException:
+        raise
+
     except Exception as e:
-        print(f"❌ Ошибка: {e}")
+        print(f"❌ Ошибка перевода: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/translate/batch", response_model=BatchTranslateResponse)
-async def translate_batch(request: BatchTranslateRequest):
+def translate_batch(request: BatchTranslateRequest):
     """Пакетный перевод (для субтитров)"""
     if not translator:
         raise HTTPException(status_code=503, detail="Модель не загружена")
-    
+
     if not request.texts:
         raise HTTPException(status_code=400, detail="Список текстов пуст")
-    
+
     try:
         start_time = time.time()
         results = []
-        
-        for i, text in enumerate(request.texts, 1):
-            print(f"🔄 Перевод {i}/{len(request.texts)}...")
-            
-            detected_lang, detected_lang_name = translator.detect_language(text)
-            translated = translator.translate(text, request.src_lang)
 
-            results.append(
-                TranslateResponse(
-                    translated_text=translated,
-                    detected_lang=detected_lang,
-                    detected_lang_name=detected_lang_name,
-                )
-            )
+        with translate_lock:
+            for i, text in enumerate(request.texts, 1):
+                print(f"🔄 Перевод {i}/{len(request.texts)}...")
+
+                # Чтобы сервер не падал на null/пустых элементах
+                if text is None:
+                    text = ""
+
+                result = _translate_one(text, request.src_lang)
+                results.append(result)
 
         total_time = time.time() - start_time
-        print(f"✅ Пакетный перевод завершен: {len(results)} текстов за {total_time:.2f}с")
-        
+
+        print(
+            f"✅ Пакетный перевод завершен: "
+            f"{len(results)} текстов за {total_time:.2f}с"
+        )
+
         return BatchTranslateResponse(
             translations=results,
             total_time=total_time
         )
-    
+
+    except HTTPException:
+        raise
+
     except Exception as e:
         print(f"❌ Ошибка пакетного перевода: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/detect", response_model=DetectLanguageResponse)
-async def detect_language(request: DetectLanguageRequest):
+def detect_language(request: DetectLanguageRequest):
     """Определение языка текста"""
     if not translator:
         raise HTTPException(status_code=503, detail="Модель не загружена")
-    
+
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="Текст не может быть пустым")
-    
+
     try:
-        lang_code, lang_name = translator.detect_language(request.text)
+        with translate_lock:
+            lang_code, lang_name = translator.detect_language(request.text)
+
         return DetectLanguageResponse(
             lang_code=lang_code,
             lang_name=lang_name
         )
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        print(f"❌ Ошибка определения языка: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================================
 # Удаление вокала через demucs + конвертация в MP3

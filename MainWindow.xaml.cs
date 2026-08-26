@@ -593,7 +593,7 @@ namespace SubtitleTranslator
         {
             try
             {
-                var cacheCirections = new List<string>() { "vocal_removed", "tempFiles" };
+                var cacheCirections = new List<string>() { "vocal_removed", "tempFiles", "subtitlesCache" };
                 foreach (var xDirectionName in cacheCirections)
                 {
                     var tempDir = Path.Combine(
@@ -1290,8 +1290,11 @@ namespace SubtitleTranslator
             string currentDir = AppDomain.CurrentDomain.BaseDirectory;
 
             // Возвращаем путь к родительской папке получаем папку где будут храниться все субтитры
-            var subPath = Directory.GetParent(Directory.GetParent(currentDir)?.FullName)?.FullName;
-            subPath = Path.Combine(subPath, "subtitles");
+            var subPath = Path.Combine(
+                    Path.GetDirectoryName(in_videoPath) ?? Environment.CurrentDirectory,
+                    "subtitlesCache"
+                );
+            
             Logger.tryDeleteFiles(subPath, "*.mp3");
             Logger.tryDeleteFiles(subPath, "*.srt");
             var subtitles = await getSubObjects();
