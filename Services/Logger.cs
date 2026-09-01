@@ -11,6 +11,7 @@ namespace SubtitleTranslator.Services
     public static class Logger
     {
         public static event Action<string> LogAdded;
+        public static event Action<string, double, bool> StatusChange;
 
         public static void Log(string in_message)
         {
@@ -22,6 +23,12 @@ namespace SubtitleTranslator.Services
             {
                 LogAdded?.Invoke(logMessage);
             });
+        }
+
+        public static void setStatus(string in_statusText, double in_progress = 0, bool in_isIndeterminateProgress = false)
+        {
+            if (StatusChange != null)
+                StatusChange(in_statusText, in_progress, in_isIndeterminateProgress);
         }
 
         public static void LogInfo(string message)

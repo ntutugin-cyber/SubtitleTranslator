@@ -107,7 +107,7 @@ namespace SubtitleTranslator.ViewModels
             IncludeSounds = false;
             IsNoRus = true;
             IsNeedSpeakerVoice = true;
-            StatusText = "Готов к работе";
+            Logger.setStatus("Готов к работе");
 
             ConvertToSubtitlesCommand = new RelayCommand(async _ => await ConvertToSubtitlesAsync(), _ => !IsProcessing && !string.IsNullOrWhiteSpace(RawJsonText));
             ConvertToTextCommand = new RelayCommand(async _ => await ConvertToTextAsync(), _ => !IsProcessing && !string.IsNullOrWhiteSpace(RawJsonText));
@@ -123,12 +123,12 @@ namespace SubtitleTranslator.ViewModels
             try
             {
                 IsProcessing = true;
-                StatusText = "Обработка JSON...";
+                Logger.setStatus("Обработка JSON...", 0, true);
                 Logger.LogProgress("Конвертация JSON в SRT...");
                 var subtitles = await getNormSub(dateStart);
                 if (subtitles != null && subtitles.Count > 0)
                 {
-                    StatusText = $"Загружено {subtitles.Count} субтитров{Logger.getInfoDurationString(dateStart)} из JSON";
+                    Logger.setStatus($"Загружено {subtitles.Count} субтитров{Logger.getInfoDurationString(dateStart)} из JSON", 0, true);
                     Logger.LogInfo(StatusText);
 
                     if (IsNeedSpeakerVoice)
@@ -155,7 +155,7 @@ namespace SubtitleTranslator.ViewModels
                     }
 
                     ResultText = srt.ToString();
-                    StatusText = $"Готово! Создано {num} субтитров";
+                    Logger.setStatus($"Готово! Создано {num} субтитров");
                     Logger.LogSuccess($"SRT создан{Logger.getInfoDurationString(dateStart)}: {num} субтитров");
                 }
             }
@@ -164,14 +164,14 @@ namespace SubtitleTranslator.ViewModels
                 Logger.LogError($"Ошибка формата JSON{Logger.getInfoDurationString(dateStart)}: {ex.Message}");
                 MessageBox.Show($"Ошибка формата JSON{Logger.getInfoDurationString(dateStart)}: {ex.Message}", "Ошибка"
                     , MessageBoxButton.OK, MessageBoxImage.Error);
-                StatusText = "Ошибка JSON";
+                Logger.setStatus("Ошибка JSON");
             }
             catch (Exception ex)
             {
                 Logger.LogError($"Ошибка{Logger.getInfoDurationString(dateStart)}: {ex.Message}");
                 MessageBox.Show($"Ошибка{Logger.getInfoDurationString(dateStart)}: {ex.Message}"
                     , "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
-                StatusText = "Ошибка";
+                Logger.setStatus("Ошибка");
             }
             finally
             {
@@ -186,12 +186,12 @@ namespace SubtitleTranslator.ViewModels
             try
             {
                 IsProcessing = true;
-                StatusText = "Обработка JSON...";
+                Logger.setStatus("Обработка JSON...", 0, true);
                 Logger.LogProgress("Конвертация JSON в текст...");
                 var subtitles = await getNormSub(dateStart);
                 if (subtitles != null && subtitles.Count > 0)
                 {
-                    StatusText = $"Загружено {subtitles.Count} субтитров{Logger.getInfoDurationString(dateStart)} из JSON";
+                    Logger.setStatus($"Загружено {subtitles.Count} субтитров{Logger.getInfoDurationString(dateStart)} из JSON", 0, true);
                     Logger.LogInfo(StatusText);
                     if (IsNeedSpeakerVoice)
                         await SpeakerAudioExtractor.createVoiceFile(subtitles);
@@ -222,12 +222,12 @@ namespace SubtitleTranslator.ViewModels
                     }
 
                     ResultText = text.ToString();
-                    StatusText = $"Готово! Создан текст{Logger.getInfoDurationString(dateStart)} из {subtitles.Count} строк";
+                    Logger.setStatus($"Готово! Создан текст{Logger.getInfoDurationString(dateStart)} из {subtitles.Count} строк");
                     Logger.LogSuccess(StatusText);
                 }
                 else
                 {
-                    StatusText = $"Неудалось распарсить json текст";
+                    Logger.setStatus($"Неудалось распарсить json текст");
                     Logger.LogSuccess(StatusText);
                 }
             }
@@ -235,14 +235,14 @@ namespace SubtitleTranslator.ViewModels
             {
                 Logger.LogError($"Ошибка формата JSON{Logger.getInfoDurationString(dateStart)}: {ex.Message}");
                 MessageBox.Show($"Ошибка формата JSON{Logger.getInfoDurationString(dateStart)}: {ex.Message}", "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
-                StatusText = "Ошибка JSON";
+                Logger.setStatus("Ошибка JSON");
             }
             catch (Exception ex)
             {
                 Logger.LogError($"Ошибка{Logger.getInfoDurationString(dateStart)}: {ex.Message}");
                 MessageBox.Show($"Ошибка{Logger.getInfoDurationString(dateStart)}: {ex.Message}"
                     , "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
-                StatusText = "Ошибка";
+                Logger.setStatus("Ошибка");
             }
             finally
             {
@@ -257,14 +257,14 @@ namespace SubtitleTranslator.ViewModels
             {
                 Logger.LogWarning("JSON пуст или не удалось распарсить");
                 MessageBox.Show("Не удалось распарсить JSON или список пуст", "Ошибка", MessageBoxButton.OK, MessageBoxImage.Warning);
-                StatusText = "Ошибка парсинга";
+                Logger.setStatus("Ошибка парсинга");
                 //return false;
             }
             else
             {
                 if (EnableTranslation || IsNoRus)
                 {
-                    StatusText = "Проверка сервера...";
+                    Logger.setStatus("Проверка сервера...", 0, true);
                     Logger.LogProgress("Проверка сервера перевода...");
 
                     if (!await _translationService.CheckHealthAsync())
@@ -272,10 +272,10 @@ namespace SubtitleTranslator.ViewModels
                         Logger.LogError($"Сервер перевода недоступен{Logger.getInfoDurationString(in_dateStart)}. Запустите: python server.py");
                         //MessageBox.Show("Сервер перевода недоступен.\nЗапустите: python server.py"
                         //    , "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
-                        StatusText = "Сервер недоступен";
+                        Logger.setStatus("Сервер недоступен");
                     }
 
-                    StatusText = "Перевод субтитров...";
+                    Logger.setStatus("Перевод субтитров...", 0, true);
                     Logger.LogProgress("Начало перевода субтитров...");
 
                     var texts = new List<string>();
@@ -299,7 +299,7 @@ namespace SubtitleTranslator.ViewModels
 
                     RawJsonText = trySerializeSubJson(ret);
 
-                    StatusText = "Перевод завершён";
+                    Logger.setStatus("Перевод завершён");
                     Logger.LogSuccess($"Перевод завершён{Logger.getInfoDurationString(in_dateStart)}: {ret.Count} субтитров");
                 }
             }
@@ -371,7 +371,7 @@ namespace SubtitleTranslator.ViewModels
         {
             RawJsonText = string.Empty;
             ResultText = string.Empty;
-            StatusText = "Очищено";
+            Logger.setStatus("Очищено");
             Logger.LogInfo("Все поля очищены");
         }
 

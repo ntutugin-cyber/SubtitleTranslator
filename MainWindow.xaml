@@ -349,14 +349,20 @@
                     </StackPanel>
 
                     <!--  ИСПРАВЛЕНО: добавлено x:Name="BtnStart"  -->
-                    <Button
-                        x:Name="BtnStart"
-                        Grid.Row="7"
-                        MinHeight="20"
-                        Margin="5"
-                        Click="onClickProcess"
-                        Content="🚀 Начать обработку"
-                        FontSize="15" />
+                    <StackPanel Grid.Row="7" Orientation="Horizontal">
+                        <Button
+                            x:Name="BtnStart"
+                            MinHeight="20"
+                            Margin="5"
+                            Click="onClickProcess"
+                            Content="🚀 Начать обработку"
+                            FontSize="15" />
+                        <Button
+                            Name="testButton"
+                            Margin="5"
+                            Click="onTestButton"
+                            Content="Проверить статус" />
+                    </StackPanel>
                 </Grid>
             </TabItem>
 
@@ -488,10 +494,12 @@
                         <!--  Кнопки  -->
                         <StackPanel Orientation="Horizontal">
                             <Button
+                                x:Name="btnInSub"
                                 Margin="10,0,0,0"
                                 Command="{Binding ConvertToSubtitlesCommand}"
                                 Content="📝 В субтитры (SRT)" />
                             <Button
+                                x:Name="btnInText"
                                 Margin="10,0,0,0"
                                 Command="{Binding ConvertToTextCommand}"
                                 Content="📄 В текст" />

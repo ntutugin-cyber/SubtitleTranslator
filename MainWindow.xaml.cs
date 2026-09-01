@@ -60,6 +60,7 @@ namespace SubtitleTranslator
 
             // Подписываемся на событие логгера
             Logger.LogAdded += OnLogAdded;
+            Logger.StatusChange += setStatus;
             Logger.LogInfo("Приложение запущено");
             tbApiUrl.Text = "http://127.0.0.1:7077";
             tbApiKey.Text = "a29a12ef250e9af9d1ed7e29c0da35fa777ba25535a27715";
@@ -122,6 +123,7 @@ namespace SubtitleTranslator
         {
             // Отписываемся при закрытии
             Logger.LogAdded -= OnLogAdded;
+            Logger.StatusChange -= setStatus;
             base.OnClosed(e);
         }
 
@@ -372,14 +374,19 @@ namespace SubtitleTranslator
             await Task.Run(() => p.WaitForExit(), in_ct);
         }
 
-        public void setStatus(string in_statusText, double in_progress = 0)
+        public void setStatus(string in_statusText, double in_progress = 0, bool in_isIndeterminateProgress = false)
         {
             // Безопасное обновление UI из фонового потока
             Dispatcher.BeginInvoke(() =>
             {
                 PbProgress.Value = in_progress;
-                PbProgress.Visibility = (in_progress == 0 || in_progress == 100) ? Visibility.Collapsed : Visibility.Visible;
+                PbProgress.Visibility = !in_isIndeterminateProgress && (in_progress == 0 || in_progress == 100)
+                    ? Visibility.Collapsed : Visibility.Visible;
                 TxtStatus.Text = in_statusText;
+                PbProgress.IsIndeterminate = in_isIndeterminateProgress;
+                
+                btnInSub.IsEnabled = !in_isIndeterminateProgress;
+                btnInText.IsEnabled = !in_isIndeterminateProgress;
             });
         }
 
@@ -506,8 +513,8 @@ namespace SubtitleTranslator
 
             _cts = new CancellationTokenSource();
             BtnStart.IsEnabled = false;
-            TxtStatus.Text = "Парсинг SRT и анализ файлов...";
-            PbProgress.IsIndeterminate = true;
+
+            setStatus($"Парсинг SRT и анализ файлов по видео: {in_videoPath}", 0, true);
 
             try
             {
@@ -535,11 +542,8 @@ namespace SubtitleTranslator
                 var ffprobePath = findFfprobe(ffmpegPath);
 
                 var mp3Durations = new List<double>();
-
                 foreach (var mp3 in mp3Files)
-                {
                     mp3Durations.Add(await getDurationAsync(mp3, ffprobePath, _cts.Token));
-                }
 
                 double videoDuration = await getDurationAsync(in_videoPath, ffprobePath, _cts.Token);
 
@@ -557,9 +561,7 @@ namespace SubtitleTranslator
                     hasInstrumental ? in_instrumentalPath : null
                 );
 
-                TxtStatus.Text = "Кодирование... (может занять время)";
-                PbProgress.IsIndeterminate = false;
-
+                setStatus($"Кодирование... (может занять время) по видео: {in_videoPath}", 0, true);
                 await runFfmpegAsync(
                     ffmpegPath,
                     arguments,
@@ -569,17 +571,17 @@ namespace SubtitleTranslator
 
                 clearCache(in_videoPath);
 
-                TxtStatus.Text = $"✅ Готово! Файл сохранён:\n{outputPath}";
+                setStatus($"✅ Готово! Файл сохранён{Logger.getInfoDurationString(dateStart)}:\n{outputPath}\n по видео: {in_videoPath}");
                 Logger.LogSuccess($"Обработка успешно завершена{Logger.getInfoDurationString(dateStart)}");
             }
             catch (OperationCanceledException)
             {
-                TxtStatus.Text = "❌ Обработка отменена.";
+                setStatus($"❌ Обработка отменена{Logger.getInfoDurationString(dateStart)}:\n    {outputPath}\n  по видео: {in_videoPath}");
                 Logger.LogSuccess($"❌ Обработка отменена{Logger.getInfoDurationString(dateStart)}");
             }
             catch (Exception ex)
             {
-                TxtStatus.Text = $"❌ Ошибка: {ex.Message}";
+                setStatus($"❌ Ошибка: {ex.Message}\n    {Logger.getInfoDurationString(dateStart)}:\n    {outputPath}\n  по видео: {in_videoPath}");
                 Logger.LogSuccess($"❌ Ошибка{Logger.getInfoDurationString(dateStart)}: {ex.Message}");
             }
             finally
@@ -589,10 +591,11 @@ namespace SubtitleTranslator
             }
         }
 
-        private static void clearCache(string in_videoPath)
+        private void clearCache(string in_videoPath)
         {
             try
             {
+                setStatus($"Очистка кэша по видео: {in_videoPath}", 0, true);
                 var cacheCirections = new List<string>() { "vocal_removed", "tempFiles", "subtitlesCache" };
                 foreach (var xDirectionName in cacheCirections)
                 {
@@ -607,7 +610,9 @@ namespace SubtitleTranslator
             }
             catch (Exception ex)
             {
-                Logger.LogError($"Ошибка при удалении папок кэша: {ex.Message}");
+                var errMess = $"Ошибка при удалении папок кэша: {ex.Message}\n по видео: {in_videoPath}";
+                setStatus(errMess, 0, true);
+                Logger.LogError(errMess);
             }
         }
 
@@ -677,7 +682,9 @@ namespace SubtitleTranslator
         private async void onClickRefreshVoices(object in_sender, RoutedEventArgs in_e)
         {
             var sw = Stopwatch.StartNew();
-            Logger.LogInfo("🔄 Загрузка списка голосов...");
+            var mess = "🔄 Загрузка списка голосов...";
+            setStatus(mess, 0, true);
+            Logger.LogInfo(mess);
 
             try
             {
@@ -1146,6 +1153,7 @@ namespace SubtitleTranslator
             var sw = Stopwatch.StartNew();
             try
             {
+                setStatus("Парсинг субтитров", 0, true);
                 if (subtitles == null)
                     subtitles = await getSubObjects();
 
@@ -1285,6 +1293,7 @@ namespace SubtitleTranslator
         private async Task speakVideo(string in_videoPath)
         {
             var sw = Stopwatch.StartNew();
+            setStatus($"Подготовка видео к озвучке: {in_videoPath}", 0, true);
 
             // Получаем путь к папке, где лежит исполняемый файл
             string currentDir = AppDomain.CurrentDomain.BaseDirectory;
@@ -1360,10 +1369,7 @@ namespace SubtitleTranslator
 
                 Directory.CreateDirectory(outputDir);
 
-                TxtStatus.Text = "🎵 Удаление вокала через сервер... Это может занять несколько минут.";
-                PbProgress.IsIndeterminate = true;
-                PbProgress.Visibility = Visibility.Visible;
-
+                setStatus($"🎵 Удаление вокала через сервер... Это может занять несколько минут. Видео: {in_videoPath}", 0, true);
                 var requireGpu = ChkRequireGpuForVocal.IsChecked == true;
 
                 var mp3Path = await removeVocalViaServerAsync(
@@ -1378,13 +1384,15 @@ namespace SubtitleTranslator
                 ret = true;
 
                 sw.Stop();
-                TxtStatus.Text = $"✅ Аудио без вокала создано за {sw.Elapsed}: {mp3Path}";
+
+                setStatus($"✅ Аудио без вокала создано за {sw.Elapsed}: {mp3Path}", 0, false);
                 Logger.LogSuccess($"Удаление вокала завершено за {sw.Elapsed}: {mp3Path}");
             }
             catch (Exception ex)
             {
                 sw.Stop();
-                TxtStatus.Text = $"❌ Ошибка удаления вокала за {sw.Elapsed}: {ex.Message}";
+
+                setStatus($"❌ Ошибка удаления вокала за {sw.Elapsed}: {ex.Message}", 0, false);
                 Logger.LogError($"Ошибка удаления вокала за {sw.Elapsed}: {ex.Message}");
 
                 MessageBox.Show(
@@ -1538,6 +1546,16 @@ namespace SubtitleTranslator
             }
 
             return string.Join("+", parts);
+        }
+
+        private bool m_testCondition = false;
+        private void onTestButton(object sender, RoutedEventArgs e)
+        {
+            m_testCondition = !m_testCondition;
+            if (m_testCondition)
+                setStatus("Проверка isIndeterminateProgress выключена", 0, false);
+            else
+                setStatus("Проверка isIndeterminateProgress включена", 0, true);
         }
     }
 }
