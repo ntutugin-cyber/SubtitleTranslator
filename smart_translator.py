@@ -10,6 +10,7 @@ from langdetect import detect, DetectorFactory, LangDetectException
 DetectorFactory.seed = 0
 
 TRANSLATE_MODEL = "facebook/nllb-200-distilled-1.3B"
+#TRANSLATE_MODEL = "facebook/nllb-200-3.3B"
 
 
 def print_elapsed(start_time: datetime, operation: str):
@@ -139,20 +140,16 @@ class SmartTranslator:
             model=model_name,
             tokenizer=self.tokenizer,
             device=self.device,
-            torch_dtype=torch.float16 if self.device == 0 else torch.float32,
+            torch_dtype=torch.bfloat16 if self.device == 0 else torch.float32,
             clean_up_tokenization_spaces=True,
         )
 
         print_elapsed(t0, "загрузка модели")
 
-        # Аккуратно определяем максимальную длину последовательности.
-        # Для NLLB чаще всего безопасно ориентироваться на 512 токенов.
         cfg = self.translator.model.config
-        config_max = (
-            getattr(cfg, "max_length", None)
-            or getattr(cfg, "max_position_embeddings", None)
-            or 512
-        )
+        # ВАЖНО: cfg.max_length у NLLB = 200 — это дефолт генерации при обучении,
+        # а не лимит входа. Берём реальную позицию-ёмкость и ограничиваем 512.
+        config_max = getattr(cfg, "max_position_embeddings", None) or 512
 
         try:
             config_max = int(config_max)
@@ -273,68 +270,45 @@ class SmartTranslator:
 
     def _split_line(self, line: str) -> List[str]:
         """
-        Разбивает длинную строку на части, чтобы каждая часть
-        помещалась в лимит токенов модели.
+        Разбивает строку на чанки. Главное отличие от старой версии:
+        несколько предложений НИКОГДА не отдаются модели одним вызовом —
+        каждое предложение переводится отдельно, поэтому модель
+        не «проглатывает» части текста.
         """
         line = line.strip()
         if not line:
             return []
 
-        if self._token_len(line) <= self.max_input_tokens:
-            return [line]
-
-        # Сначала пробуем резать по предложениям.
-        sentences = re.split(r'(?<=[.!?…])\s+', line)
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?…])\s+', line) if s.strip()]
+        if not sentences:
+            sentences = [line]
 
         chunks: List[str] = []
-        cur = ""
-
         for sent in sentences:
-            sent = sent.strip()
-            if not sent:
+            # Нормальное предложение — отдельный чанк
+            if self._token_len(sent) <= self.max_input_tokens:
+                chunks.append(sent)
                 continue
 
-            candidate = f"{cur} {sent}".strip() if cur else sent
-
-            if self._token_len(candidate) <= self.max_input_tokens:
-                cur = candidate
-                continue
-
+            # Слишком длинное предложение — режем по словам
+            cur = ""
+            for word in sent.split():
+                candidate = f"{cur} {word}".strip() if cur else word
+                if self._token_len(candidate) <= self.max_input_tokens:
+                    cur = candidate
+                else:
+                    if cur:
+                        chunks.append(cur)
+                    # Одно слово длиннее лимита — режем посимвольно
+                    if self._token_len(word) > self.max_input_tokens:
+                        step = 150
+                        for i in range(0, len(word), step):
+                            chunks.append(word[i:i + step])
+                        cur = ""
+                    else:
+                        cur = word
             if cur:
                 chunks.append(cur)
-                cur = ""
-
-            if self._token_len(sent) <= self.max_input_tokens:
-                cur = sent
-            else:
-                # Если одно предложение слишком длинное, режем по словам.
-                words = sent.split()
-                cur = ""
-
-                for word in words:
-                    candidate = f"{cur} {word}".strip() if cur else word
-
-                    if self._token_len(candidate) <= self.max_input_tokens:
-                        cur = candidate
-                    else:
-                        if cur:
-                            chunks.append(cur)
-                            cur = ""
-
-                        # Если одно слово слишком длинное, режем его посимвольно.
-                        if self._token_len(word) > self.max_input_tokens:
-                            step = 150
-                            for i in range(0, len(word), step):
-                                chunks.append(word[i:i + step])
-                        else:
-                            cur = word
-
-                if cur:
-                    chunks.append(cur)
-                    cur = ""
-
-        if cur:
-            chunks.append(cur)
 
         return chunks or [line]
 
@@ -431,7 +405,7 @@ class SmartTranslator:
             input_len = len(encoded.input_ids)
             max_allowed_output = self.max_seq_len - input_len - 2
 
-        desired_tokens = int(input_len * 2.0) + 32
+        desired_tokens = int(input_len * 2.5) + 48
         max_new_tokens = max(24, min(max_allowed_output, desired_tokens))
 
         try:

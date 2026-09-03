@@ -681,6 +681,11 @@ namespace SubtitleTranslator
         private ObservableCollection<VoiceItem> m_voiceAllItems = new ObservableCollection<VoiceItem>();
         private async void onClickRefreshVoices(object in_sender, RoutedEventArgs in_e)
         {
+            refreshSpisVoice();
+        }
+
+        private async Task refreshSpisVoice()
+        {
             var sw = Stopwatch.StartNew();
             var mess = "🔄 Загрузка списка голосов...";
             setStatus(mess, 0, true);
@@ -731,7 +736,7 @@ namespace SubtitleTranslator
         }
 
         private TelegramParser m_telegramParser;
-        private void onClickParseTelegram(object in_sender, RoutedEventArgs in_e)
+        private async void onClickParseTelegram(object in_sender, RoutedEventArgs in_e)
         {
             var text = RawJsonTextBox.Text.Trim();
             if (!string.IsNullOrWhiteSpace(text))
@@ -745,7 +750,7 @@ namespace SubtitleTranslator
                     m_telegramParser = new TelegramParser(text);
                     tbResultText.Text = m_telegramParser.getMyFormatText();
                     var psevdonims = m_telegramParser.getPsevdonims();
-                    fillVoiceItemsRandomly(psevdonims);
+                    await fillVoiceItemsRandomly(psevdonims);
                     sw.Stop();
                     Logger.LogSuccess($"Распарсен текст из телеграмма за {sw.Elapsed}.");
                     setStatus($"✅ Распарсен текст из телеграмма");
@@ -761,8 +766,9 @@ namespace SubtitleTranslator
             }
         }
 
-        private void fillVoiceItemsRandomly(Dictionary<string, Tuple<int, int>> in_psevdonims)
+        private async Task fillVoiceItemsRandomly(Dictionary<string, Tuple<int, int>> in_psevdonims)
         {
+            await refreshSpisVoice();
             if (m_voiceAllItems.Count == 0)
             {
                 Logger.LogInfo("Ошибка: список доступных голосов пуст.");
@@ -822,6 +828,9 @@ namespace SubtitleTranslator
             Dispatcher.BeginInvoke(() =>
             {
                 dgVoices.ItemsSource = m_voiceItems;
+
+                // Обновляем интерфейс
+                dgVoices.Items.Refresh();
             });
 
             Logger.LogInfo(mess);
@@ -1139,7 +1148,7 @@ namespace SubtitleTranslator
             selectedItem.Name = selectedVoice.Name;
             selectedItem.Value = selectedVoice.Value;
 
-            // 3. Обновляем интерфейс (см. пояснение ниже)
+            // 3. Обновляем интерфейс
             dgVoices.Items.Refresh();
         }
 
@@ -1163,7 +1172,7 @@ namespace SubtitleTranslator
                     if (in_isSpeak)
                         await speakMethod(in_firstPath, psevdonims, subtitles);
                     else
-                        fillVoiceItemsRandomly(psevdonims);
+                        await fillVoiceItemsRandomly(psevdonims);
 
                     sw.Stop();
                     var mess = $"✅ Распарсен текст субтитров за {sw.Elapsed}.";
