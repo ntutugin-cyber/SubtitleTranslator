@@ -33,6 +33,7 @@ namespace SubtitleTranslator
 
         private readonly HiggsApiService _api = new();
         private CancellationTokenSource? _cts;
+        private const int MaxTtsChunkLength = 350;
         private readonly Stopwatch _appStopwatch = Stopwatch.StartNew();
         private ObservableCollection<VoiceItem> m_voiceItems = new ObservableCollection<VoiceItem>();
 
@@ -192,22 +193,125 @@ namespace SubtitleTranslator
         }
 
         private string buildFilterComplex(
-		    List<SubtitleItem> in_blocks,
-		    List<double> in_mp3Durations,
-		    bool in_hasInstrumental)
+            List<SubtitleItem> in_blocks,
+            List<double> in_mp3Durations,
+            bool in_hasInstrumental,
+            double in_videoDuration = 0,
+            bool in_allowHardTrim = false)
         {
-            var parts = new List<string>();
-
-            string timeline = buildTimelineExpression(in_blocks);
+            const double maxSpeed = 1.5;
 
             int voiceCount = Math.Min(in_blocks.Count, in_mp3Durations.Count);
+
+            // Если есть инструментал, он занимает вход 1,
+            // значит голосовые файлы начинаются со входа 2.
+            // Если инструментала нет, голосовые начинаются со входа 1.
+            int voiceInputStart = in_hasInstrumental ? 2 : 1;
+
+            var voiceParts = new List<string>();
+            var labels = new List<string>();
+            var windows = new List<(double Start, double End)>();
+
+            for (int i = 0; i < voiceCount; i++)
+            {
+                double start = Math.Max(0, in_blocks[i].StartTime.TotalSeconds);
+                double srtEnd = Math.Max(start + 0.05, in_blocks[i].EndTime.TotalSeconds);
+
+                double limitEnd = srtEnd;
+
+                if (i + 1 < in_blocks.Count)
+                {
+                    double nextStart = in_blocks[i + 1].StartTime.TotalSeconds;
+
+                    if (nextStart > start + 0.05)
+                    {
+                        // Жёсткая граница до начала следующей реплики.
+                        // Это защищает от наложения, но может вызывать обрезку,
+                        // если текущая озвучка слишком длинная.
+                        limitEnd = nextStart;
+                    }
+                }
+                else if (in_videoDuration > start + 0.05)
+                {
+                    // Для последнего блока можно разрешить звучать до конца видео,
+                    // чтобы последняя длинная фраза не резалась о EndTime субтитра.
+                    limitEnd = Math.Max(srtEnd, in_videoDuration);
+                }
+
+                double slot = Math.Max(0.05, limitEnd - start);
+                double mp3Dur = Math.Max(0, in_mp3Durations[i]);
+
+                double speed = 1.0;
+
+                if (mp3Dur > slot)
+                {
+                    double needed = mp3Dur / slot;
+
+                    speed = Math.Min(maxSpeed, Math.Ceiling(needed * 1000.0) / 1000.0);
+
+                    if (speed < 1.0)
+                        speed = 1.0;
+                }
+
+                double finalDur = mp3Dur > 0 ? mp3Dur / speed : 0;
+
+                bool tooLong = finalDur > slot + 0.03;
+                bool needTrim = tooLong && in_allowHardTrim;
+
+                if (needTrim)
+                    finalDur = slot;
+
+                if (finalDur <= 0.01)
+                    finalDur = Math.Min(slot, 0.1);
+
+                if (tooLong)
+                {
+                    Logger.LogInfo(
+                        $"⚠️ Блок {i + 1}: MP3 = {mp3Dur:F2}s, окно = {slot:F2}s, " +
+                        $"скорость = {speed:F2}x, после ускорения = {finalDur:F2}s. " +
+                        (needTrim
+                            ? "Обрезка включена: хвост будет срезан."
+                            : "Обрезка отключена: возможно наложение на следующую реплику."));
+                }
+
+                windows.Add((start, start + finalDur));
+
+                int delayMs = (int)Math.Round(start * 1000.0, MidpointRounding.AwayFromZero);
+                string label = $"v{i}";
+                labels.Add(label);
+
+                string trimFilter = string.Empty;
+
+                if (needTrim)
+                {
+                    double fadeStart = Math.Max(0, slot - 0.08);
+
+                    trimFilter =
+                        $",atrim=end={slot.ToString("0.000", CultureInfo.InvariantCulture)}" +
+                        $",asetpts=PTS-STARTPTS" +
+                        $",afade=t=out:st={fadeStart.ToString("0.000", CultureInfo.InvariantCulture)}:d=0.08";
+                }
+
+                voiceParts.Add(
+                    $"[{voiceInputStart + i}:a]" +
+                    $"aformat=channel_layouts=stereo," +
+                    $"atempo={speed.ToString("0.000", CultureInfo.InvariantCulture)}" +
+                    trimFilter +
+                    $",adelay={delayMs}|{delayMs}" +
+                    $"[{label}]"
+                );
+            }
+
+            string timeline = buildTimelineExpression(windows);
+
+            var parts = new List<string>();
 
             if (in_hasInstrumental)
             {
                 // Если есть озвучка, инструментал внутри субтитров делаем потише,
                 // чтобы голос был разборчивее.
                 // Если озвучки нет, оставляем почти полную громкость.
-                double instrumentalVolume = voiceCount > 0 ? 0.95 : 1;
+                double instrumentalVolume = voiceCount > 0 ? 0.85 : 1;
 
                 // Оригинальная дорожка:
                 // внутри субтитров молчит, вне субтитров звучит как есть.
@@ -216,7 +320,7 @@ namespace SubtitleTranslator
                 // Инструментал:
                 // вне субтитров молчит, внутри субтитров звучает.
                 parts.Add(
-                    $"[1:a]volume=0:enable='not({timeline})'," +
+                    $"[1:a]volume=0:enable='not({timeline}')," +
                     $"volume={instrumentalVolume.ToString("0.00", CultureInfo.InvariantCulture)}:enable='{timeline}'" +
                     $"[a_inst_part]"
                 );
@@ -234,31 +338,7 @@ namespace SubtitleTranslator
                     parts.Add("[0:a]volume=0.03[a_bg]");
             }
 
-            var labels = new List<string>();
-
-            // Если есть инструментал, он занимает вход 1,
-            // значит голосовые файлы начинаются со входа 2.
-            // Если инструментала нет, голосовые начинаются со входа 1.
-            int voiceInputStart = in_hasInstrumental ? 2 : 1;
-
-            for (int i = 0; i < voiceCount; i++)
-            {
-                double srtDur = (in_blocks[i].EndTime - in_blocks[i].StartTime).TotalSeconds;
-
-                double speed = in_mp3Durations[i] > srtDur
-                    ? Math.Min(1.3, in_mp3Durations[i] / srtDur)
-                    : 1.0;
-
-                int delayMs = (int)in_blocks[i].StartTime.TotalMilliseconds;
-                string label = $"v{i}";
-                labels.Add(label);
-                parts.Add(
-                    $"[{voiceInputStart + i}:a]" +
-                    $"atempo={speed.ToString("0.00", CultureInfo.InvariantCulture)}," +
-                    $"adelay={delayMs}|{delayMs}" +
-                    $"[{label}]"
-                );
-            }
+            parts.AddRange(voiceParts);
 
             if (labels.Count > 1)
             {
@@ -272,6 +352,48 @@ namespace SubtitleTranslator
                 parts.Add("[a_bg]anull[a_out]");
 
             return string.Join(";", parts);
+        }
+
+        private string buildTimelineExpression(List<(double Start, double End)> in_windows)
+        {
+            if (in_windows == null || in_windows.Count == 0)
+                return "0";
+
+            var parts = new List<string>();
+
+            foreach (var w in in_windows)
+            {
+                double start = Math.Max(0, w.Start);
+                double end = Math.Max(start + 0.05, w.End);
+
+                parts.Add(
+                    $"between(t,{start.ToString("0.000", CultureInfo.InvariantCulture)}," +
+                    $"{end.ToString("0.000", CultureInfo.InvariantCulture)})"
+                );
+            }
+
+            return string.Join("+", parts);
+        }
+        
+        private string[] getOrderedMp3Files(string in_folder)
+        {
+            var dir = new DirectoryInfo(in_folder);
+
+            return dir.GetFiles("*.mp3")
+                .OrderBy(f => getNumericPrefix(f.Name))
+                .ThenBy(f => f.Name, StringComparer.OrdinalIgnoreCase)
+                .Select(f => f.FullName)
+                .ToArray();
+        }
+
+        private int getNumericPrefix(string in_name)
+        {
+            var match = Regex.Match(in_name, @"^\s*(\d+)");
+
+            if (match.Success && int.TryParse(match.Groups[1].Value, out int n))
+                return n;
+
+            return int.MaxValue;
         }
 
         private List<string> buildFfmpegArgs(
@@ -323,19 +445,26 @@ namespace SubtitleTranslator
             return args;
         }
 
-        private async Task runFfmpegAsync(string in_ffmpeg, List<string> in_args, double in_totalDuration, CancellationToken in_ct)
+        private async Task runFfmpegAsync(
+            string in_ffmpeg,
+            List<string> in_args,
+            double in_totalDuration,
+            CancellationToken in_ct)
         {
             var psi = new ProcessStartInfo
             {
                 FileName = in_ffmpeg,
-                Arguments = string.Join(" ", in_args.Select(a => $"\"{a}\"")),
                 RedirectStandardError = true,
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
 
+            foreach (var arg in in_args)
+                psi.ArgumentList.Add(arg);
+
             using var p = Process.Start(psi);
-            if (p == null) throw new Exception("Не удалось запустить ffmpeg.exe");
+            if (p == null)
+                throw new Exception("Не удалось запустить ffmpeg.exe");
 
             // Ограничиваем частоту обновления UI (макс 5 раз в секунду), чтобы интерфейс не лагал
             DateTime lastUpdate = DateTime.MinValue;
@@ -352,26 +481,67 @@ namespace SubtitleTranslator
                 if ((DateTime.Now - lastUpdate).TotalMilliseconds < 200) return;
                 lastUpdate = DateTime.Now;
 
-                double currentTime = TimeSpan.Parse(timeMatch.Groups[1].Value, CultureInfo.InvariantCulture).TotalSeconds;
-                double progress = in_totalDuration > 0 ? Math.Min(100, (currentTime / in_totalDuration) * 100) : 0;
+                double currentTime = TimeSpan.Parse(
+                    timeMatch.Groups[1].Value,
+                    CultureInfo.InvariantCulture
+                ).TotalSeconds;
+
+                double progress = in_totalDuration > 0
+                    ? Math.Min(100, currentTime / in_totalDuration * 100)
+                    : 0;
 
                 // Ищем скорость кодирования (speed=1.23x)
                 double speed = 1.0;
                 var speedMatch = Regex.Match(e.Data, @"speed=(\d+\.?\d*)x");
-                if (speedMatch.Success && double.TryParse(speedMatch.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out double s1))
+
+                if (speedMatch.Success &&
+                    double.TryParse(
+                        speedMatch.Groups[1].Value,
+                        NumberStyles.Float,
+                        CultureInfo.InvariantCulture,
+                        out double s1))
                     speed = s1;
 
                 // Расчёт оставшегося времени и времени завершения
-                double remainingSec = (speed > 0.01 && in_totalDuration > currentTime) ? (in_totalDuration - currentTime) / speed : 0;
-                var eta = DateTime.Now.AddSeconds(Math.Max(0, remainingSec));
-                string etaText = (remainingSec > 0 && in_totalDuration > 0) ? $"{eta:HH:mm:ss}" : "???";
+                double remainingSec = speed > 0.01 && in_totalDuration > currentTime
+                    ? (in_totalDuration - currentTime) / speed
+                    : 0;
 
-                string statusText = $"📊 Прогресс: {progress:F1}% | ⚡ Скорость: {speed:F2}x | ⏳ Осталось: {formatTimeSpan(TimeSpan.FromSeconds(remainingSec))} | 🕒 Готово: {etaText}";
+                var eta = DateTime.Now.AddSeconds(Math.Max(0, remainingSec));
+
+                string etaText = remainingSec > 0 && in_totalDuration > 0
+                    ? $"{eta:HH:mm:ss}"
+                    : "???";
+
+                string statusText =
+                    $"📊 Прогресс: {progress:F1}% | " +
+                    $"⚡ Скорость: {speed:F2}x | " +
+                    $"⏳ Осталось: {formatTimeSpan(TimeSpan.FromSeconds(remainingSec))} | " +
+                    $"🕒 Готово: {etaText}";
+
                 setStatus(statusText, progress);
             };
 
             p.BeginErrorReadLine();
-            await Task.Run(() => p.WaitForExit(), in_ct);
+
+            using (in_ct.Register(() =>
+            {
+                try
+                {
+                    if (!p.HasExited)
+                        p.Kill(true);
+                }
+                catch
+                {
+                    // ignore
+                }
+            }))
+            {
+                await Task.Run(() => p.WaitForExit(), in_ct);
+            }
+
+            if (p.ExitCode != 0)
+                throw new Exception($"ffmpeg завершился с кодом {p.ExitCode}. Проверьте лог выше.");
         }
 
         public void setStatus(string in_statusText, double in_progress = 0, bool in_isIndeterminateProgress = false)
@@ -518,12 +688,7 @@ namespace SubtitleTranslator
 
             try
             {
-                var mp3Files = new DirectoryInfo(in_mp3Folder)
-                    .GetFiles("*.mp3")
-                    .OrderBy(f => f.LastWriteTime) // Сортировка по дате изменения (по возрастанию)
-                    .ThenBy(f => f.Name) // Вторичная сортировка по имени (на случай совпадающих дат)
-                    .Select(f => f.FullName)
-                    .ToArray();
+                var mp3Files = getOrderedMp3Files(in_mp3Folder);
 
                 // Если файлов озвучки нет — разрешаем сделать только фон.
                 // Если файлы есть, их количество должно совпадать с блоками субтитров.
@@ -550,7 +715,9 @@ namespace SubtitleTranslator
                 string filterComplex = buildFilterComplex(
                     in_srtBlocks,
                     mp3Durations,
-                    hasInstrumental
+                    hasInstrumental,
+                    videoDuration,
+                    in_allowHardTrim: false
                 );
 
                 var arguments = buildFfmpegArgs(
@@ -1054,12 +1221,12 @@ namespace SubtitleTranslator
                                 try
                                 {
                                     tryCount++;
-                                    await _api.SynthesizeToFileAsync(
-                                        input: comments,
-                                        voice: voiceItem.Value,
-                                        format: "mp3",
-                                        outputPath: outPath,
-                                        ct: _cts.Token);
+                                    await synthesizeLongTextToFileAsync(
+                                        comments,
+                                        outPath,
+                                        voiceItem.Value,
+                                        _cts.Token,
+                                        MaxTtsChunkLength);
 
                                     index += 1;
                                     partSw.Stop();
@@ -1134,6 +1301,328 @@ namespace SubtitleTranslator
             }
 
             return ret;
+        }
+
+        private List<string> splitTextIntoChunks(string in_text, int in_maxLength = 350)
+        {
+            var result = new List<string>();
+
+            if (string.IsNullOrWhiteSpace(in_text))
+                return result;
+
+            in_text = Regex.Replace(in_text, @"\s+", " ").Trim();
+
+            if (in_text.Length <= in_maxLength)
+            {
+                result.Add(in_text);
+                return result;
+            }
+
+            var sentences = Regex.Split(in_text, @"(?<=[.!?…])\s+");
+            var sb = new StringBuilder();
+
+            foreach (var sentenceRaw in sentences)
+            {
+                var sentence = sentenceRaw.Trim();
+
+                if (string.IsNullOrWhiteSpace(sentence))
+                    continue;
+
+                if (sentence.Length > in_maxLength)
+                {
+                    if (sb.Length > 0)
+                    {
+                        result.Add(sb.ToString().Trim());
+                        sb.Clear();
+                    }
+
+                    result.AddRange(splitLongStringByWords(sentence, in_maxLength));
+                }
+                else if (sb.Length + sentence.Length + 1 <= in_maxLength)
+                {
+                    if (sb.Length > 0)
+                        sb.Append(' ');
+
+                    sb.Append(sentence);
+                }
+                else
+                {
+                    result.Add(sb.ToString().Trim());
+                    sb.Clear();
+                    sb.Append(sentence);
+                }
+            }
+
+            if (sb.Length > 0)
+                result.Add(sb.ToString().Trim());
+
+            return result
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .ToList();
+        }
+
+        private List<string> splitLongStringByWords(string in_text, int in_maxLength)
+        {
+            var result = new List<string>();
+            var sb = new StringBuilder();
+
+            var parts = Regex.Split(in_text, @"(?<=[,;:!?…])\s+");
+
+            foreach (var partRaw in parts)
+            {
+                var part = partRaw.Trim();
+
+                if (string.IsNullOrWhiteSpace(part))
+                    continue;
+
+                if (part.Length > in_maxLength)
+                {
+                    if (sb.Length > 0)
+                    {
+                        result.Add(sb.ToString().Trim());
+                        sb.Clear();
+                    }
+
+                    var words = part.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+
+                    foreach (var word in words)
+                    {
+                        if (word.Length > in_maxLength)
+                        {
+                            if (sb.Length > 0)
+                            {
+                                result.Add(sb.ToString().Trim());
+                                sb.Clear();
+                            }
+
+                            for (int i = 0; i < word.Length; i += in_maxLength)
+                            {
+                                result.Add(word.Substring(i, Math.Min(in_maxLength, word.Length - i)));
+                            }
+                        }
+                        else if (sb.Length + word.Length + 1 > in_maxLength)
+                        {
+                            if (sb.Length > 0)
+                                result.Add(sb.ToString().Trim());
+
+                            sb.Clear();
+                            sb.Append(word);
+                        }
+                        else
+                        {
+                            if (sb.Length > 0)
+                                sb.Append(' ');
+
+                            sb.Append(word);
+                        }
+                    }
+                }
+                else if (sb.Length + part.Length + 1 <= in_maxLength)
+                {
+                    if (sb.Length > 0)
+                        sb.Append(' ');
+
+                    sb.Append(part);
+                }
+                else
+                {
+                    if (sb.Length > 0)
+                        result.Add(sb.ToString().Trim());
+
+                    sb.Clear();
+                    sb.Append(part);
+                }
+            }
+
+            if (sb.Length > 0)
+                result.Add(sb.ToString().Trim());
+
+            return result;
+        }
+
+        private async Task synthesizeLongTextToFileAsync(
+            string in_text,
+            string in_outputPath,
+            string in_voice,
+            CancellationToken in_ct,
+            int in_maxChunkLength = 350)
+        {
+            var chunks = splitTextIntoChunks(in_text, in_maxChunkLength);
+
+            if (chunks.Count == 0)
+                return;
+
+            if (chunks.Count == 1)
+            {
+                await synthesizeChunkWithRetryAsync(chunks[0], in_outputPath, in_voice, in_ct);
+                return;
+            }
+
+            setStatus($"🧩 Длинный текст ({in_text.Length} симв.) разбит на {chunks.Count} частей для озвучки. Файл: {in_outputPath}", 0, true);
+
+            var tempDir = Path.Combine(Path.GetTempPath(), $"tts_chunks_{Guid.NewGuid():N}");
+            Directory.CreateDirectory(tempDir);
+
+            var chunkFiles = new List<string>();
+
+            try
+            {
+                for (int i = 0; i < chunks.Count; i++)
+                {
+                    in_ct.ThrowIfCancellationRequested();
+
+                    var chunkPath = Path.Combine(tempDir, $"chunk_{i:D4}.mp3");
+
+                    await synthesizeChunkWithRetryAsync(
+                        chunks[i],
+                        chunkPath,
+                        in_voice,
+                        in_ct
+                    );
+
+                    chunkFiles.Add(chunkPath);
+                    setStatus($"🧩 Длинный текст ({in_text.Length} симв.) разбит на {chunks.Count} частей для озвучки. Файл: {in_outputPath}", 0, true);
+                }
+
+                await concatMp3FilesAsync(chunkFiles, in_outputPath, in_ct);
+            }
+            finally
+            {
+                try
+                {
+                    Directory.Delete(tempDir, true);
+                }
+                catch
+                {
+                    // ignore
+                }
+            }
+        }
+
+        private async Task synthesizeChunkWithRetryAsync(
+            string in_text,
+            string in_outputPath,
+            string in_voice,
+            CancellationToken in_ct,
+            int in_maxAttempts = 10)
+        {
+            for (int attempt = 1; attempt <= in_maxAttempts; attempt++)
+            {
+                try
+                {
+                    await _api.SynthesizeToFileAsync(
+                        input: in_text,
+                        voice: in_voice,
+                        format: "mp3",
+                        outputPath: in_outputPath,
+                        ct: in_ct
+                    );
+
+                    if (File.Exists(in_outputPath) && new FileInfo(in_outputPath).Length > 0)
+                        return;
+
+                    throw new Exception("TTS вернул пустой файл.");
+                }
+                catch (Exception ex) when (!in_ct.IsCancellationRequested && attempt < in_maxAttempts)
+                {
+                    setStatus($"TTS ошибка для куска текста {in_outputPath} голосом {in_voice} (попытка {attempt}/{in_maxAttempts}): {ex.Message}", 0, true);
+                    if (attempt == in_maxAttempts)
+                    Logger.LogError(
+                        $"Неудалось озвучить кусок {in_outputPath} голосом {in_voice} с {attempt} попыток: {ex.Message}"
+                    );
+
+                    await Task.Delay(1000, in_ct);
+                }
+            }
+        }
+
+        private async Task concatMp3FilesAsync(
+            List<string> in_files,
+            string in_outputPath,
+            CancellationToken in_ct)
+        {
+            if (in_files.Count == 0)
+                return;
+
+            if (in_files.Count == 1)
+            {
+                File.Copy(in_files[0], in_outputPath, true);
+                return;
+            }
+
+            var ffmpegPath = TxtFfmpeg.Text.Trim();
+
+            if (string.IsNullOrWhiteSpace(ffmpegPath))
+            {
+                throw new Exception(
+                    "Для склейки длинной озвучки нужно указать корректный путь к ffmpeg.exe."
+                );
+            }
+
+            var listFile = Path.Combine(Path.GetTempPath(), $"ffmpeg_concat_{Guid.NewGuid():N}.txt");
+
+            try
+            {
+                var lines = in_files.Select(f =>
+                {
+                    var safePath = f.Replace('\\', '/').Replace("'", @"'\''");
+                    return $"file '{safePath}'";
+                });
+
+                File.WriteAllLines(listFile, lines);
+                var argsCopy = new List<string>
+                    {
+                        "-y",
+                        "-f", "concat",
+                        "-safe", "0",
+                        "-i", listFile,
+                        "-c", "copy",
+                        in_outputPath
+                    };
+
+                try
+                {
+                    await runFfmpegAsync(ffmpegPath, argsCopy, 0, in_ct);
+
+                    if (File.Exists(in_outputPath) && new FileInfo(in_outputPath).Length > 0)
+                        return;
+                }
+                catch (Exception ex) when (!in_ct.IsCancellationRequested)
+                {
+                    Logger.LogInfo(
+                        $"Склейка через -c copy не удалась. Пробую перекодировать. Ошибка: {ex.Message}"
+                    );
+                }
+
+                var argsReencode = new List<string>
+                    {
+                        "-y",
+                        "-f", "concat",
+                        "-safe", "0",
+                        "-i", listFile,
+                        "-c:a", "libmp3lame",
+                        "-b:a", "192k",
+                        in_outputPath
+                    };
+
+                await runFfmpegAsync(ffmpegPath, argsReencode, 0, in_ct);
+
+                if (!File.Exists(in_outputPath) || new FileInfo(in_outputPath).Length == 0)
+                {
+                    throw new Exception("Не удалось получить итоговый склеенный MP3-файл.");
+                }
+            }
+            finally
+            {
+                try
+                {
+                    File.Delete(listFile);
+                }
+                catch
+                {
+                    // ignore
+                }
+            }
         }
 
         private void onClickSetVoice(object in_sender, RoutedEventArgs in_e)
@@ -1531,40 +2020,6 @@ namespace SubtitleTranslator
                     }
                 }
             }
-        }
-
-        private string buildTimelineExpression(List<SubtitleItem> in_blocks)
-        {
-            if (in_blocks == null || in_blocks.Count == 0)
-                return "0";
-
-            var parts = new List<string>();
-
-            foreach (var block in in_blocks)
-            {
-                double start = Math.Max(0, block.StartTime.TotalSeconds);
-                double end = block.EndTime.TotalSeconds;
-
-                if (end <= start)
-                    end = start + 0.1;
-
-                parts.Add(
-                    $"between(t,{start.ToString("0.000", CultureInfo.InvariantCulture)}," +
-                    $"{end.ToString("0.000", CultureInfo.InvariantCulture)})"
-                );
-            }
-
-            return string.Join("+", parts);
-        }
-
-        private bool m_testCondition = false;
-        private void onTestButton(object sender, RoutedEventArgs e)
-        {
-            m_testCondition = !m_testCondition;
-            if (m_testCondition)
-                setStatus("Проверка isIndeterminateProgress выключена", 0, false);
-            else
-                setStatus("Проверка isIndeterminateProgress включена", 0, true);
         }
     }
 }

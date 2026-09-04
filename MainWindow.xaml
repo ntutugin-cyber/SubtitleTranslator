@@ -357,11 +357,6 @@
                             Click="onClickProcess"
                             Content="🚀 Начать обработку"
                             FontSize="15" />
-                        <Button
-                            Name="testButton"
-                            Margin="5"
-                            Click="onTestButton"
-                            Content="Проверить статус" />
                     </StackPanel>
                 </Grid>
             </TabItem>

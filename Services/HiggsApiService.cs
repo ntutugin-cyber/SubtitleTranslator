@@ -145,14 +145,10 @@ namespace SubtitleTranslator.Services
         {
             var payload = new Dictionary<string, object>
             {
-                ["model"] = "current",
                 ["input"] = input,
                 ["voice"] = voice,
-                ["response_format"] = format,
-                ["max_tokens"] = 4096,
-                ["temperature"] = 1.0,
-                ["top_p"] = 0.95,
-                ["top_k"] = 50
+                ["max_tokens"] = 7000,
+                ["response_format"] = format
             };
 
             using var req = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/v1/audio/speech");
