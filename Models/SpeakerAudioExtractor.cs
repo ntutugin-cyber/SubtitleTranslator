@@ -9,19 +9,22 @@ using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
+using SubtitleTranslator.Services;
 
 namespace SubtitleTranslator.Models
 {
     public static class SpeakerAudioExtractor
     {
         private static readonly Regex BracketRegex =
-            new Regex(@"\[[^\]]*\]", RegexOptions.Compiled);
+            new Regex(@"[[^]]*]", RegexOptions.Compiled);
 
         private sealed class SpeechSegment
         {
             public int Speaker { get; set; }
             public double Start { get; set; }
             public double End { get; set; }
+            /// <summary>Оригинальный текст реплики (без служебных тегов вида [Music]).</summary>
+            public string Text { get; set; }
         }
 
         private sealed class AudioSegment
@@ -29,10 +32,15 @@ namespace SubtitleTranslator.Models
             public double Start { get; set; }
             public double End { get; set; }
             public double Duration => End - Start;
+            /// <summary>Исходные речевые сегменты, из которых склеен этот кусок аудио.</summary>
+            public List<SpeechSegment> Sources { get; } = new List<SpeechSegment>();
         }
 
         /// <summary>
         /// Извлекает голос каждого спикера из видео по уже распарсенным субтитрам.
+        /// Дополнительно рядом с каждым "Speaker N.mp3" создаёт "Speaker N.txt" —
+        /// оригинальный текст реплик, которые реально попали в вырезанный аудиофрагмент
+        /// (этот текст удобно использовать как reference_text при клонировании голоса).
         /// </summary>
         public static async Task<List<string>> extractSpeakerAudioAsync(
             string in_videoPath,
@@ -43,7 +51,8 @@ namespace SubtitleTranslator.Models
             int in_preferredSegmentCount = 2,
             int in_absoluteMaxSegmentCount = 3,
             double in_minUsefulDurationSeconds = 8.0,
-            bool in_keepFullAudio = false)
+            bool in_keepFullAudio = false,
+            bool in_writeReferenceTexts = true)
         {
             if (string.IsNullOrWhiteSpace(in_videoPath))
                 throw new ArgumentException("Не указан путь к видео.", nameof(in_videoPath));
@@ -61,7 +70,7 @@ namespace SubtitleTranslator.Models
             in_preferredSegmentCount = Math.Max(1, Math.Min(in_preferredSegmentCount, in_absoluteMaxSegmentCount));
             in_minUsefulDurationSeconds = Math.Max(0, Math.Min(in_minUsefulDurationSeconds, in_maxSecondsPerSpeaker));
 
-            // Превращаем SubtitleItem в рабочие речевые сегменты.
+            // Превращаем SubtitleItem в рабочие речевые сегменты (с текстом).
             var speechSegments = new List<SpeechSegment>();
 
             foreach (var item in in_subtitles)
@@ -123,8 +132,17 @@ namespace SubtitleTranslator.Models
                     selected,
                     outputPath,
                     in_maxSecondsPerSpeaker);
-
                 resultFiles.Add(outputPath);
+
+                // === НОВОЕ: пишем оригинальный текст рядом с mp3, тем же именем ===
+                if (in_writeReferenceTexts)
+                {
+                    var textPath = Path.Combine(tempDir, $"Speaker {group.Key}.txt");
+                    tryDeleteFile(textPath);
+                    var referenceText = BuildReferenceText(selected);
+                    if (!string.IsNullOrWhiteSpace(referenceText))
+                        await File.WriteAllTextAsync(textPath, referenceText, new UTF8Encoding(true));
+                }
             }
 
             if (!in_keepFullAudio)
@@ -147,7 +165,8 @@ namespace SubtitleTranslator.Models
             int preferredSegmentCount = 2,
             int absoluteMaxSegmentCount = 3,
             double minUsefulDurationSeconds = 8.0,
-            bool keepFullAudio = false)
+            bool keepFullAudio = false,
+            bool writeReferenceTexts = true)
         {
             if (parseSubtitles == null)
                 throw new ArgumentNullException(nameof(parseSubtitles));
@@ -167,7 +186,8 @@ namespace SubtitleTranslator.Models
                 preferredSegmentCount,
                 absoluteMaxSegmentCount,
                 minUsefulDurationSeconds,
-                keepFullAudio);
+                keepFullAudio,
+                writeReferenceTexts);
         }
 
         public static async Task<bool> createVoiceFile(List<SubtitleItem> in_subs)
@@ -190,6 +210,28 @@ namespace SubtitleTranslator.Models
             return ret;
         }
 
+        /// <summary>
+        /// Собирает оригинальный текст всех реплик, попавших в выбранные аудиофрагменты.
+        /// Каждая реплика — с новой строки, в хронологическом порядке, без повторов подряд.
+        /// </summary>
+        private static string BuildReferenceText(IReadOnlyList<AudioSegment> in_segments)
+        {
+            var sb = new StringBuilder();
+            string lastLine = null;
+            foreach (var segment in in_segments.OrderBy(s => s.Start))
+            {
+                foreach (var source in segment.Sources.OrderBy(s => s.Start))
+                {
+                    var line = source.Text?.Trim();
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    if (line == lastLine) continue;
+                    sb.AppendLine(line);
+                    lastLine = line;
+                }
+            }
+            return sb.ToString().Trim();
+        }
+
         private static SpeechSegment CreateSpeechSegment(SubtitleItem item)
         {
             if (item == null)
@@ -208,12 +250,15 @@ namespace SubtitleTranslator.Models
 
             if (string.IsNullOrWhiteSpace(cleanedContent))
                 return null;
+            if (cleanedContent.StartsWith("[") && cleanedContent.EndsWith("]"))
+                return null;
 
             return new SpeechSegment
             {
                 Speaker = item.Speaker,
                 Start = start,
-                End = end
+                End = end,
+                Text = cleanedContent
             };
         }
 
@@ -260,12 +305,9 @@ namespace SubtitleTranslator.Models
 
                 if (result.Count == 0)
                 {
-                    result.Add(new AudioSegment
-                    {
-                        Start = segment.Start,
-                        End = segment.End
-                    });
-
+                    var first = new AudioSegment { Start = segment.Start, End = segment.End };
+                    first.Sources.Add(segment);
+                    result.Add(first);
                     continue;
                 }
 
@@ -283,14 +325,13 @@ namespace SubtitleTranslator.Models
                 {
                     if (segment.End > last.End)
                         last.End = segment.End;
+                    last.Sources.Add(segment);
                 }
                 else
                 {
-                    result.Add(new AudioSegment
-                    {
-                        Start = segment.Start,
-                        End = segment.End
-                    });
+                    var next = new AudioSegment { Start = segment.Start, End = segment.End };
+                    next.Sources.Add(segment);
+                    result.Add(next);
                 }
             }
 
@@ -352,11 +393,17 @@ namespace SubtitleTranslator.Models
                 if (take < minCutSeconds)
                     continue;
 
-                selected.Add(new AudioSegment
+                var taken = new AudioSegment
                 {
                     Start = candidate.Start,
                     End = candidate.Start + take
-                });
+                };
+                // Берём только те реплики, которые реально звучат внутри взятого куска.
+                foreach (var src in candidate.Sources
+                             .Where(s => s.Start < taken.End + epsilon && s.End > taken.Start - epsilon)
+                             .OrderBy(s => s.Start))
+                    taken.Sources.Add(src);
+                selected.Add(taken);
 
                 totalDuration += take;
 
@@ -381,17 +428,17 @@ namespace SubtitleTranslator.Models
 
             return RunFfmpegAsync(ffmpegPath, new[]
             {
-            "-hide_banner", "-loglevel", "error", "-y",
-            "-i", inputAudioPath,
-            "-filter_complex", filter,
-            "-map", "[out]",
-            "-ac", "2",
-            "-ar", "44100",
-            "-codec:a", "libmp3lame",
-            "-b:a", "192k",
-            "-t", FormatSeconds(maxDuration),
-            outputPath
-        });
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-i", inputAudioPath,
+                "-filter_complex", filter,
+                "-map", "[out]",
+                "-ac", "2",
+                "-ar", "44100",
+                "-codec:a", "libmp3lame",
+                "-b:a", "192k",
+                "-t", FormatSeconds(maxDuration),
+                outputPath
+            });
         }
 
         private static string BuildFilter(IReadOnlyList<AudioSegment> segments)
@@ -446,12 +493,7 @@ namespace SubtitleTranslator.Models
 
             foreach (var argument in arguments)
                 psi.ArgumentList.Add(argument);
-
-            using var process = new Process
-            {
-                StartInfo = psi
-            };
-
+            using var process = new Process { StartInfo = psi };
             try
             {
                 process.Start();

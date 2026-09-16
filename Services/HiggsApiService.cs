@@ -170,6 +170,80 @@ namespace SubtitleTranslator.Services
             }
             catch { }
         }
+
+        /// <summary>
+        /// Клонирование голоса: синтез текста голосом из референс-аудио
+        /// (POST /v1/higgs/voice-clone) с необязательным текстом референса.
+        /// </summary>
+        public async Task CloneVoiceToFileAsync(
+            string input,
+            string referenceAudioPath,
+            string referenceText,
+            string format,
+            string outputPath,
+            CancellationToken ct,
+            int maxTokens = 7000)
+        {
+            if (string.IsNullOrWhiteSpace(input))
+                throw new ArgumentException("Пустой текст для клонирования.", nameof(input));
+            if (string.IsNullOrWhiteSpace(referenceAudioPath) || !File.Exists(referenceAudioPath))
+                throw new FileNotFoundException("Не найден референс-аудиофайл для клонирования.", referenceAudioPath);
+
+            var payload = new Dictionary<string, object>
+            {
+                ["input"] = input,
+                ["reference_audio_path"] = Path.GetFullPath(referenceAudioPath),
+                ["response_format"] = format
+            };
+            // Текст референса заметно повышает сходство голоса — передаём, если он есть.
+            if (!string.IsNullOrWhiteSpace(referenceText))
+                payload["reference_text"] = referenceText;
+
+            using var req = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/v1/higgs/voice-clone");
+            req.Content = new StringContent(
+                JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
+            using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+            resp.EnsureSuccessStatusCode();
+            await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+            await using var fs = File.Create(outputPath);
+            await stream.CopyToAsync(fs, ct);
+        }
+
+        /// <summary>
+        /// Клонирование с ретраями и проверкой результата на диске.
+        /// </summary>
+        public async Task CloneVoiceWithRetryAsync(
+            string input,
+            string referenceAudioPath,
+            string referenceText,
+            string format,
+            string outputPath,
+            CancellationToken ct,
+            int maxAttempts = 10,
+            Action<string> onRetry = null)
+        {
+            var errors = new List<string>();
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                try
+                {
+                    await CloneVoiceToFileAsync(input, referenceAudioPath, referenceText, format, outputPath, ct);
+                    if (File.Exists(outputPath) && new FileInfo(outputPath).Length > 0)
+                        return;
+                    throw new Exception("voice-clone вернул пустой файл.");
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    errors.Add(ex.Message);
+                    onRetry?.Invoke($"Попытка {attempt}/{maxAttempts}: {ex.Message}");
+                    if (attempt == maxAttempts)
+                        throw new Exception(
+                            $"Не удалось клонировать реплику за {maxAttempts} попыток: {string.Join(" | ", errors)}");
+                    await Task.Delay(1000, ct);
+                }
+            }
+        }
     }
 
     public static class TextSplitter
@@ -196,7 +270,7 @@ namespace SubtitleTranslator.Services
         }
     }
 
-public class VoiceItem : INotifyPropertyChanged
+    public class VoiceItem : INotifyPropertyChanged
     {
         private string _psevdonim = "";
         private string _name = "";
@@ -246,6 +320,47 @@ public class VoiceItem : INotifyPropertyChanged
         }
 
         public override string ToString() => Name;
+
+        public event PropertyChangedEventHandler PropertyChanged;
+        protected void OnPropertyChanged([CallerMemberName] string propertyName = null)
+            => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+    }
+
+    /// <summary>Строка таблицы очереди дубляжа.</summary>
+    public class DubQueueItem : INotifyPropertyChanged
+    {
+        private string _videoPath = "";
+        private string _jsonPath = "";
+        private string _status = "В очереди";
+        private double _progress;
+        private string _videoDuration = "";
+        private string _dubTime = "";
+        private string _ratio = "";
+        private string _error = "";
+
+        public string VideoPath
+        {
+            get => _videoPath;
+            set { _videoPath = value; OnPropertyChanged(); OnPropertyChanged(nameof(VideoName)); }
+        }
+        public string VideoName => string.IsNullOrEmpty(_videoPath) ? "" : Path.GetFileName(_videoPath);
+
+        public string JsonPath
+        {
+            get => _jsonPath;
+            set { _jsonPath = value; OnPropertyChanged(); OnPropertyChanged(nameof(JsonName)); }
+        }
+        public string JsonName => string.IsNullOrEmpty(_jsonPath) ? "—" : Path.GetFileName(_jsonPath);
+
+        public string Status { get => _status; set { _status = value; OnPropertyChanged(); } }
+        public double Progress { get => _progress; set { _progress = value; OnPropertyChanged(); } }
+        /// <summary>Длительность видео (чч:мм:сс).</summary>
+        public string VideoDuration { get => _videoDuration; set { _videoDuration = value; OnPropertyChanged(); } }
+        /// <summary>Время, за которое видео озвучилось.</summary>
+        public string DubTime { get => _dubTime; set { _dubTime = value; OnPropertyChanged(); } }
+        /// <summary>Соотношение длительности видео ко времени озвучки (видео:озвучка).</summary>
+        public string Ratio { get => _ratio; set { _ratio = value; OnPropertyChanged(); } }
+        public string Error { get => _error; set { _error = value; OnPropertyChanged(); } }
 
         public event PropertyChangedEventHandler PropertyChanged;
         protected void OnPropertyChanged([CallerMemberName] string propertyName = null)

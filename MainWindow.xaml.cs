@@ -19,6 +19,7 @@ using static System.Runtime.InteropServices.JavaScript.JSType;
 using System.Net.Http;
 using System.Text.Json;
 using System.Xml.Serialization;
+using NAudio.CoreAudioApi;
 
 namespace SubtitleTranslator
 {
@@ -36,6 +37,10 @@ namespace SubtitleTranslator
         private const int MaxTtsChunkLength = 350;
         private readonly Stopwatch _appStopwatch = Stopwatch.StartNew();
         private ObservableCollection<VoiceItem> m_voiceItems = new ObservableCollection<VoiceItem>();
+        private readonly ObservableCollection<DubQueueItem> m_dubQueue = new();
+        private bool m_isDubQueueRunning;
+        private TimeSpan m_totalDubTime = TimeSpan.Zero;
+        private int m_totalDubbedVideos;
 
         /// <summary> Создаем свойство, которое будет хранить нашу ViewModel </summary>
         public RawJsonViewModel m_rawJsonVM { get; set; }
@@ -73,6 +78,8 @@ namespace SubtitleTranslator
             cm.Click += (s, e) => onClickSetVoice(s, e);
             dgVoices.ContextMenu = new ContextMenu();
             dgVoices.ContextMenu.Items.Add(cm);
+
+            dgDubQueue.ItemsSource = m_dubQueue;
         }
 
         private void onPropertyChangedVoiceItem(object in_sender, System.ComponentModel.PropertyChangedEventArgs in_)
@@ -810,7 +817,11 @@ namespace SubtitleTranslator
             return true;
         }
 
-        private bool ShowErr(string in_msg) { MessageBox.Show(in_msg, "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error); return false; }
+        private bool ShowErr(string in_msg)
+        {
+            Logger.LogError(in_msg);
+            MessageBox.Show(in_msg, "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error); return false;
+        }
 
         private async void onClickCheckServer(object in_sender, RoutedEventArgs in_e)
         {
@@ -2021,5 +2032,754 @@ namespace SubtitleTranslator
                 }
             }
         }
+
+        #region Пакетная озвучка нескольких видео с клонированием голосов
+
+        private async void onClickBatchSpeakVideos(object in_sender, RoutedEventArgs in_e)
+        {
+            var dlgVideos = new OpenFolderDialog
+            {
+                Title = "Выберите папку с видео и JSON-переводами (имена файлов должны совпадать)"
+            };
+            if (dlgVideos.ShowDialog() != true)
+                return;
+
+            string voicesRoot = null;
+            var dlgVoices = new OpenFolderDialog
+            {
+                Title = "Папка с сохранёнными голосами (Speaker N.mp3 + Speaker N.txt). " +
+                        "Нажмите «Отмена», если образцы голосов нужно извлечь из самих видео."
+            };
+            if (dlgVoices.ShowDialog() == true)
+                voicesRoot = dlgVoices.FolderName;
+
+            try
+            {
+                await batchSpeakVideosAsync(dlgVideos.FolderName, voicesRoot);
+            }
+            catch (OperationCanceledException)
+            {
+                setStatus("❌ Пакетная озвучка отменена.");
+                Logger.LogInfo("Пакетная озвучка отменена пользователем.");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"Ошибка пакетной озвучки: {ex.Message}");
+                setStatus("❌ Ошибка пакетной озвучки");
+                MessageBox.Show(ex.Message, "Ошибка пакетной озвучки",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        /// <summary>
+        /// Пакетная озвучка: для каждого видео в папке ищет JSON-перевод с тем же именем,
+        /// берёт образцы голосов (Speaker N.mp3 + Speaker N.txt) из папки сохранённых голосов
+        /// (или извлекает их из видео через SpeakerAudioExtractor — сразу с txt),
+        /// клонирует голос через /v1/higgs/voice-clone для каждой переведённой реплики
+        /// и собирает итоговое видео существующим микшером speakVideo(...).
+        /// </summary>
+        private async Task batchSpeakVideosAsync(string in_videoDir, string in_voicesRoot)
+        {
+            var sw = Stopwatch.StartNew();
+            _cts = new CancellationTokenSource();
+            var ct = _cts.Token;
+
+            var videos = Directory.GetFiles(in_videoDir, "*.mp4")
+                .Concat(Directory.GetFiles(in_videoDir, "*.mkv"))
+                .Concat(Directory.GetFiles(in_videoDir, "*.avi"))
+                .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (videos.Count == 0)
+            {
+                ShowErr($"В папке {in_videoDir} не найдено видеофайлов (*.mp4, *.mkv, *.avi).");
+                return;
+            }
+
+            var ffmpegPath = TxtFfmpeg.Text.Trim();
+            int videoNum = 0;
+            foreach (var videoPath in videos)
+            {
+                ct.ThrowIfCancellationRequested();
+                videoNum++;
+                var baseName = Path.GetFileNameWithoutExtension(videoPath);
+                var jsonPath = findSubtitlesJsonForVideo(videoPath);
+                if (jsonPath == null)
+                {
+                    Logger.LogError($"Видео {baseName}: рядом не найден JSON с переводом. Пропуск.");
+                    continue;
+                }
+
+                setStatus($"🎬 [{videoNum}/{videos.Count}] {baseName}: чтение JSON {Path.GetFileName(jsonPath)}", 0, true);
+                var subtitles = deserializeSubtitlesJson(await File.ReadAllTextAsync(jsonPath, ct));
+                var speakList = subtitles
+                    .Where(x => !string.IsNullOrWhiteSpace(x.TranslatedContent)
+                                && !x.TranslatedContent.Trim().StartsWith("["))
+                    .OrderBy(x => x.Start)
+                    .ToList();
+                if (speakList.Count == 0)
+                {
+                    Logger.LogError($"Видео {baseName}: в JSON нет реплик с переводом. Пропуск.");
+                    continue;
+                }
+
+                try
+                {
+                    // --- 1. Образцы голосов: папка сохранённых голосов или извлечение из видео ---
+                    var resolvedVoices = resolveVoicesFolder(in_voicesRoot, baseName);
+                    string extractedVoices = null;
+
+                    string getRefAudio(int speaker)
+                    {
+                        foreach (var folder in new[] { extractedVoices, resolvedVoices })
+                        {
+                            if (string.IsNullOrWhiteSpace(folder)) continue;
+                            var p = Path.Combine(folder, $"Speaker {speaker}.mp3");
+                            if (File.Exists(p)) return p;
+                        }
+                        return null;
+                    }
+                    string getRefText(int speaker)
+                    {
+                        foreach (var folder in new[] { extractedVoices, resolvedVoices })
+                        {
+                            if (string.IsNullOrWhiteSpace(folder)) continue;
+                            var p = Path.Combine(folder, $"Speaker {speaker}.txt");
+                            if (File.Exists(p)) return File.ReadAllText(p);
+                        }
+                        return null;
+                    }
+                    async Task ensureExtractedAsync()
+                    {
+                        if (extractedVoices != null) return;
+                        setStatus($"🎬 [{videoNum}/{videos.Count}] {baseName}: извлекаю образцы голосов из видео...", 0, true);
+                        var extracted = await SpeakerAudioExtractor.extractSpeakerAudioAsync(
+                            videoPath, subtitles, ffmpegPath);
+                        if (extracted.Count > 0)
+                            extractedVoices = Path.GetDirectoryName(extracted[0]);
+                    }
+
+                    // --- 2. Синтез переведённых реплик клонированным голосом ---
+                    var subPath = Path.Combine(in_videoDir, "subtitlesCache");
+                    Logger.tryDeleteFiles(subPath, "*.mp3");
+                    Directory.CreateDirectory(subPath);
+                    var countAll = speakList.Count();
+                    var elapsedMilliseconds = new List<long>();
+                    int index = 1;
+                    foreach (var sub in speakList)
+                    {
+                        var partSw = Stopwatch.StartNew();
+                        ct.ThrowIfCancellationRequested();
+                        var outPath = Path.Combine(subPath, $"{index:D3}_subtitlesCache.mp3");
+                        var refAudio = getRefAudio(sub.Speaker);
+                        if (refAudio == null)
+                        {
+                            await ensureExtractedAsync();
+                            refAudio = getRefAudio(sub.Speaker);
+                        }
+
+                        if (refAudio != null)
+                        {
+                            var refText = getRefText(sub.Speaker);
+                            await cloneSpeakWithRetryAsync(sub.TranslatedContent, refAudio, refText, outPath, ct);
+                        }
+                        else
+                        {
+                            Logger.LogInfo($"Видео {baseName}: для спикера {sub.Speaker} нет образца голоса — синтезирую голосом default.");
+                            await _api.SynthesizeToFileAsync(sub.TranslatedContent, "default", "mp3", outPath, ct);
+                        }
+
+                        partSw.Stop();
+                        elapsedMilliseconds.Add(partSw.ElapsedMilliseconds);
+                        if (elapsedMilliseconds.Count > 10)
+                            elapsedMilliseconds.RemoveAt(0);
+                        var avgMill = Convert.ToInt32(elapsedMilliseconds.Sum() / elapsedMilliseconds.Count);
+                        var ostalosMilliseconds = (countAll - index) * avgMill;
+                        var tmpOst = new TimeSpan(0, 0, 0, 0, ostalosMilliseconds);
+                        var fileSize = getStrSizeFile(new FileInfo(outPath).Length);
+                        var duration = AudioProcessor.getAudioDuration(outPath);
+                        var percent = Math.Round(Convert.ToDouble(index) / (Convert.ToDouble(countAll) / 100.0), 3);
+                        var outFileName = System.IO.Path.GetFileNameWithoutExtension(outPath);
+
+                        setStatus($"🎬 [{videoNum}/{videos.Count}] {baseName}: реплика {index}/{speakList.Count} (спикер {sub.Speaker}). Прошло {sw.Elapsed}, примерно осталось {tmpOst}. Прогресс: {percent}% Файл: {outFileName} ({duration} - {fileSize})", percent);
+                        Math.Round(100.0 * index / speakList.Count, 1);
+                        index++;
+                    }
+
+                    // --- 3. Инструментал (опционально) и финальная склейка с видео ---
+                    string instrumental = null;
+                    if (ChkUseInstrumentalOnSubtitles.IsChecked == true)
+                    {
+                        setStatus($"🎬 [{videoNum}/{videos.Count}] {baseName}: удаление вокала для инструментала...", 0, true);
+                        if (await removeVocal(videoPath))
+                            instrumental = TxtInstrumental.Text.Trim();
+                    }
+
+                    var newFileName = $"{baseName} RusAudio.mp4";
+                    await speakVideo(subPath, videoPath, newFileName, speakList, instrumental);
+                    Logger.LogSuccess($"🎬 [{videoNum}/{videos.Count}] Видео {baseName} озвучено: {newFileName}");
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    // Ошибка одного видео не останавливает весь пакет.
+                    Logger.LogError($"Видео {baseName}: ошибка озвучки: {ex.Message}");
+                    setStatus($"❌ Видео {baseName}: ошибка озвучки: {ex.Message}");
+                }
+            }
+
+            sw.Stop();
+            setStatus($"✅ Пакетная озвучка завершена за {sw.Elapsed}. Видео в обработке: {videos.Count}.");
+            Logger.LogSuccess($"Пакетная озвучка завершена за {sw.Elapsed}.");
+        }
+
+        /// <summary>POST /v1/higgs/voice-clone: синтез фразы голосом из reference-аудио.</summary>
+        private async Task cloneSpeakToFileAsync(
+            string in_input,
+            string in_referenceAudioPath,
+            string in_referenceText,
+            string in_outputPath,
+            CancellationToken in_ct)
+        {
+            var baseUrl = tbApiUrl.Text.Trim().TrimEnd('/');
+            var url = $"{baseUrl}/v1/higgs/voice-clone";
+            var payload = new Dictionary<string, object>
+            {
+                ["input"] = in_input,
+                ["reference_audio_path"] = Path.GetFullPath(in_referenceAudioPath),
+                ["response_format"] = "mp3",
+                ["max_tokens"] = 2048
+            };
+            if (!string.IsNullOrWhiteSpace(in_referenceText))
+                payload["reference_text"] = in_referenceText;
+
+            using var content = new StringContent(
+                JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+            using var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
+            request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {tbApiKey.Text.Trim()}");
+
+            using var response = await _vocalHttpClient.SendAsync(request, in_ct);
+            var bytes = await response.Content.ReadAsByteArrayAsync(in_ct);
+            if (!response.IsSuccessStatusCode)
+                throw new Exception($"voice-clone HTTP {(int)response.StatusCode}: {Encoding.UTF8.GetString(bytes)}");
+            if (bytes.Length == 0)
+                throw new Exception("voice-clone вернул пустой файл.");
+            await File.WriteAllBytesAsync(in_outputPath, bytes, in_ct);
+        }
+
+        private async Task cloneSpeakWithRetryAsync(
+            string in_input,
+            string in_referenceAudio,
+            string in_referenceText,
+            string in_outputPath,
+            CancellationToken in_ct,
+            int in_maxAttempts = 10)
+        {
+            var errors = new List<string>();
+            for (int attempt = 1; attempt <= in_maxAttempts; attempt++)
+            {
+                try
+                {
+                    await cloneSpeakToFileAsync(in_input, in_referenceAudio, in_referenceText, in_outputPath, in_ct);
+                    if (File.Exists(in_outputPath) && new FileInfo(in_outputPath).Length > 0)
+                        return;
+                    throw new Exception("Сервер вернул пустой файл.");
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    errors.Add(ex.Message);
+                    setStatus($"⚠️ Клонирование голоса, попытка {attempt}/{in_maxAttempts}: {ex.Message}", 0, true);
+                    await Task.Delay(1000, in_ct);
+                }
+            }
+            throw new Exception($"Не удалось клонировать реплику за {in_maxAttempts} попыток: {string.Join(" | ", errors)}");
+        }
+
+        /// <summary>Ищет JSON-перевод рядом с видео: имя.json, имя_ru.json, *имя*.json, либо единственный json в папке.</summary>
+        private static string findSubtitlesJsonForVideo(string in_videoPath)
+        {
+            var ext = Path.GetExtension(in_videoPath);
+            var dir = Path.GetDirectoryName(in_videoPath) ?? ".";
+            var baseName = Path.GetFileNameWithoutExtension(in_videoPath);
+            string ret = null;
+            if (ext == ".mp4")
+            {
+                var candidates = new[]
+                {
+                    Path.Combine(dir, baseName + ".json"),
+                    Path.Combine(dir, baseName + "_ru.json"),
+                    Path.Combine(dir, baseName + ".ru.json"),
+                };
+
+                foreach (var c in candidates)
+                    if (File.Exists(c))
+                        ret = c;
+
+                if (string.IsNullOrWhiteSpace(ret))
+                {
+                    var byName = Directory.GetFiles(dir, "*.json")
+                    .FirstOrDefault(f => Path.GetFileNameWithoutExtension(f)
+                        .Contains(baseName, StringComparison.OrdinalIgnoreCase));
+                    if (byName != null)
+                        ret = byName;
+
+                    if (string.IsNullOrWhiteSpace(ret))
+                    {
+                        var allJson = Directory.GetFiles(dir, "*.json");
+                        var allVideos = Directory.GetFiles(dir, "*.mp4")
+                            .Concat(Directory.GetFiles(dir, "*.mkv"))
+                            .Concat(Directory.GetFiles(dir, "*.avi"))
+                            .ToArray();
+
+                        if (allJson.Length == 1 && allVideos.Length == 1)
+                            ret = allJson[0];
+                    }
+                }
+            }
+            else if (ext == ".json")
+            {
+                var candidates = new[]
+                {
+                    Path.Combine(dir, baseName + ".mp4"),
+                };
+
+                foreach (var c in candidates)
+                    if (File.Exists(c))
+                        ret = in_videoPath;
+
+                if (string.IsNullOrWhiteSpace(ret))
+                {
+                    var byName = Directory.GetFiles(dir, "*.mp4")
+                    .FirstOrDefault(f => Path.GetFileNameWithoutExtension(f)
+                        .Contains(baseName, StringComparison.OrdinalIgnoreCase));
+
+                    if (byName != null) ret = in_videoPath;
+                }
+            }
+
+            var resultVideoPath = Path.Combine(dir, $"{baseName} RusAudio.mp4");
+            if (File.Exists(resultVideoPath))
+            {
+                Logger.LogInfo($"Уже есть переведённый файл: {resultVideoPath}");
+                ret = null;
+            }
+
+            return ret;
+        }
+
+        /// <summary>
+        /// Определяет папку с образцами голосов для конкретного видео:
+        /// voicesRoot/&lt;имя видео&gt;/ → voicesRoot/tempFiles/ → voicesRoot/ (если там лежат Speaker *.mp3).
+        /// </summary>
+        private static string resolveVoicesFolder(string in_voicesRoot, string in_videoBaseName)
+        {
+            if (string.IsNullOrWhiteSpace(in_voicesRoot)) return null;
+            var perVideo = Path.Combine(in_voicesRoot, in_videoBaseName);
+            if (Directory.Exists(perVideo) && Directory.GetFiles(perVideo, "Speaker *.mp3").Length > 0)
+                return perVideo;
+            var temp = Path.Combine(in_voicesRoot, "tempFiles");
+            if (Directory.Exists(temp) && Directory.GetFiles(temp, "Speaker *.mp3").Length > 0)
+                return temp;
+            if (Directory.GetFiles(in_voicesRoot, "Speaker *.mp3").Length > 0)
+                return in_voicesRoot;
+            return null;
+        }
+
+        /// <summary>
+        /// Терпимый парсер JSON субтитров: игнорирует пробелы в именах ключей и значениях
+        /// (вид "Index ", "00:00:04 " в пример.json), заполняет Start/End из StartTime/EndTime при нужде.
+        /// </summary>
+        public static List<SubtitleItem> deserializeSubtitlesJson(string in_json)
+        {
+            var ret = new List<SubtitleItem>();
+            if (string.IsNullOrWhiteSpace(in_json)) return ret;
+            using var doc = JsonDocument.Parse(in_json);
+            if (doc.RootElement.ValueKind != JsonValueKind.Array) return ret;
+
+            int autoIndex = 0;
+            foreach (var el in doc.RootElement.EnumerateArray())
+            {
+                if (el.ValueKind != JsonValueKind.Object) continue;
+                var item = new SubtitleItem { Content = "", TranslatedContent = "", DetectedLang = "" };
+                foreach (var prop in el.EnumerateObject())
+                {
+                    switch (prop.Name.Trim())
+                    {
+                        case "Index":
+                            item.Index = prop.Value.ValueKind == JsonValueKind.Number
+                                ? prop.Value.GetInt32()
+                                : (int.TryParse(prop.Value.GetString()?.Trim(), out var ii) ? ii : 0);
+                            break;
+                        case "StartTime":
+                            item.StartTime = parseJsonTime(prop.Value.GetString());
+                            break;
+                        case "EndTime":
+                            item.EndTime = parseJsonTime(prop.Value.GetString());
+                            break;
+                        case "Start":
+                            item.Start = prop.Value.GetDouble();
+                            break;
+                        case "End":
+                            item.End = prop.Value.GetDouble();
+                            break;
+                        case "Speaker":
+                            item.Speaker = prop.Value.ValueKind == JsonValueKind.Number
+                                ? prop.Value.GetInt32()
+                                : (int.TryParse(prop.Value.GetString()?.Trim(), out var ss) ? ss : 0);
+                            break;
+                        case "Content":
+                            item.Content = prop.Value.GetString()?.Trim() ?? "";
+                            break;
+                        case "TranslatedContent":
+                            item.TranslatedContent = prop.Value.GetString()?.Trim() ?? "";
+                            break;
+                        case "DetectedLang":
+                            item.DetectedLang = prop.Value.GetString()?.Trim() ?? "";
+                            break;
+                    }
+                }
+                if (item.Index <= 0) item.Index = ++autoIndex; else autoIndex = item.Index;
+                if (item.End <= item.Start && item.EndTime > item.StartTime)
+                {
+                    item.Start = item.StartTime.TotalSeconds;
+                    item.End = item.EndTime.TotalSeconds;
+                }
+                ret.Add(item);
+            }
+            return ret;
+        }
+
+        private static TimeSpan parseJsonTime(string in_value)
+        {
+            var s = in_value?.Trim();
+            if (string.IsNullOrWhiteSpace(s)) return TimeSpan.Zero;
+            if (TimeSpan.TryParseExact(s, @"hh\:mm\:ss", CultureInfo.InvariantCulture, out var ts))
+                return ts;
+            return TimeSpan.Parse(s, CultureInfo.InvariantCulture);
+        }
+
+        #endregion
+
+        #region Очередь дубляжа переводов
+
+        private void onClickAddVideosToDubQueue(object in_sender, RoutedEventArgs in_e)
+        {
+            var dlg = new OpenFileDialog
+            {
+                Filter = "Video Files|*.mp4;*.json;*.avi",
+                Multiselect = true,
+                Title = "Добавить видео в очередь дубляжа"
+            };
+
+            if (dlg.ShowDialog() == true)
+                addVideosToDubQueue(dlg.FileNames);
+        }
+
+        private void onClickAddFolderToDubQueue(object in_sender, RoutedEventArgs in_e)
+        {
+            var dlg = new OpenFolderDialog { Title = "Папка с видео для очереди дубляжа" };
+            if (dlg.ShowDialog() != true) return;
+            var files = Directory.GetFiles(dlg.FolderName, "*.mp4")
+                .Concat(Directory.GetFiles(dlg.FolderName, "*.json"))
+                .Concat(Directory.GetFiles(dlg.FolderName, "*.avi"))
+                .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            addVideosToDubQueue(files);
+        }
+
+        private void addVideosToDubQueue(IEnumerable<string> in_videoPaths)
+        {
+            int added = 0;
+            foreach (var path in in_videoPaths)
+            {
+                if (m_dubQueue.Any(x => string.Equals(x.VideoPath, path, StringComparison.OrdinalIgnoreCase)))
+                    continue;
+
+                var jsonPath = findSubtitlesJsonForVideo(path);
+                if (string.IsNullOrWhiteSpace(jsonPath))
+                    Logger.LogError($"Нет JSON по пути: {path}");
+                else
+                {
+                    var videoPath = path;
+                    var ext = Path.GetExtension(path);
+                    if (ext == ".json")
+                        videoPath = $"{path.Substring(0, path.Length - 5)}.mp4";
+
+                    var item = new DubQueueItem
+                    {
+                        VideoPath = videoPath,
+                        JsonPath = jsonPath ?? "",
+                        Status = string.IsNullOrWhiteSpace(jsonPath) ? "Нет JSON" : "В очереди"
+                    };
+
+                    m_dubQueue.Add(item);
+                    added++;
+                }
+            }
+
+            dgDubQueue.Items.Refresh();
+            Logger.LogInfo($"➕ Добавлено в очередь дубляжа: {added}. Всего в очереди: {m_dubQueue.Count}.");
+            setStatus($"➕ В очереди дубляжа: {m_dubQueue.Count} видео.");
+        }
+
+        private void onClickRemoveSelectedFromDubQueue(object in_sender, RoutedEventArgs in_e)
+        {
+            if (m_isDubQueueRunning) { ShowErr("Очередь выполняется — изменять её нельзя."); return; }
+            var selected = dgDubQueue.SelectedItems.Cast<DubQueueItem>().ToList();
+            foreach (var item in selected) m_dubQueue.Remove(item);
+            dgDubQueue.Items.Refresh();
+        }
+
+        private void onClickClearDubQueue(object in_sender, RoutedEventArgs in_e)
+        {
+            if (m_isDubQueueRunning) { ShowErr("Очередь выполняется — очищать её нельзя."); return; }
+            m_dubQueue.Clear();
+            dgDubQueue.Items.Refresh();
+        }
+
+        private async void onClickStartDubQueue(object in_sender, RoutedEventArgs in_e)
+        {
+            if (m_isDubQueueRunning) { Logger.LogInfo("Очередь дубляжа уже выполняется."); return; }
+            var pending = m_dubQueue.Where(x => x.Status != "Готово").ToList();
+            if (pending.Count == 0) { ShowErr("Очередь пуста или все видео уже озвучены."); return; }
+
+            m_isDubQueueRunning = true;
+            _cts = new CancellationTokenSource();
+            _api.Configure(tbApiUrl.Text.Trim().TrimEnd('/'), tbApiKey.Text.Trim());
+            try
+            {
+                await processDubQueueAsync(_cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                setStatus("❌ Очередь дубляжа прервана.");
+                Logger.LogInfo("Очередь дубляжа прервана пользователем.");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"Ошибка очереди дубляжа: {ex.Message}");
+                MessageBox.Show(ex.Message, "Ошибка очереди дубляжа", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            finally
+            {
+                m_isDubQueueRunning = false;
+            }
+        }
+
+        private async Task processDubQueueAsync(CancellationToken in_ct)
+        {
+            var queueSw = Stopwatch.StartNew();
+            m_totalDubTime = TimeSpan.Zero;
+            m_totalDubbedVideos = 0;
+            int totalVideos = m_dubQueue.Count(x => x.Status != "Готово");
+            int videoNum = 0;
+
+            foreach (var item in m_dubQueue.ToList())
+            {
+                if (item.Status == "Готово") continue;
+                in_ct.ThrowIfCancellationRequested();
+                videoNum++;
+                await processOneDubVideoAsync(item, videoNum, totalVideos, in_ct);
+            }
+
+            queueSw.Stop();
+            var mess = $"✅ Очередь дубляжа завершена за {queueSw.Elapsed}. " +
+                       $"Озвучено видео: {m_totalDubbedVideos}. Суммарное время озвучки: {formatTimeSpan(m_totalDubTime)}.";
+            setStatus(mess);
+            Logger.LogSuccess(mess);
+        }
+
+        /// <summary>
+        /// Полный цикл по одному видео очереди:
+        /// 1) заново извлекаются образцы голосов (Speaker N.mp3) и тексты-референсы (Speaker N.txt);
+        /// 2) каждую переведённую реплику клонируем голосом соответствующего спикера;
+        /// 3) склейка с видео; 4) удаление временных файлов (готовое видео остаётся);
+        /// 5) лог: время озвучки, соотношение длительности видео и времени озвучки, суммарное время.
+        /// </summary>
+        private async Task processOneDubVideoAsync(DubQueueItem in_item, int in_videoNum, int in_totalVideos, CancellationToken in_ct)
+        {
+            var videoPath = in_item.VideoPath;
+            var baseName = Path.GetFileNameWithoutExtension(videoPath);
+            var videoDir = Path.GetDirectoryName(videoPath) ?? Environment.CurrentDirectory;
+            var videoSw = Stopwatch.StartNew();
+            in_item.Status = "В работе";
+            in_item.Progress = 0;
+            in_item.Error = "";
+            try
+            {
+                // --- 0. JSON перевода ---
+                var jsonPath = in_item.JsonPath;
+                if (string.IsNullOrWhiteSpace(jsonPath) || !File.Exists(jsonPath))
+                {
+                    jsonPath = findSubtitlesJsonForVideo(videoPath);
+                    in_item.JsonPath = jsonPath ?? "";
+                }
+                if (string.IsNullOrWhiteSpace(jsonPath))
+                    throw new Exception("Не найден JSON с переводом рядом с видео.");
+                var subtitles = deserializeSubtitlesJson(await File.ReadAllTextAsync(jsonPath, in_ct));
+                var speakList = subtitles
+                    .Where(x => !string.IsNullOrWhiteSpace(x.TranslatedContent)
+                                && !x.TranslatedContent.Trim().StartsWith("["))
+                    .OrderBy(x => x.Start)
+                    .ToList();
+                if (speakList.Count == 0)
+                    throw new Exception("В JSON нет реплик с переводом.");
+
+                // --- 1. Заново извлекаем образцы голосов И тексты-референсы для этого видео ---
+                var tempDir = Path.Combine(videoDir, "tempFiles");
+                Logger.tryDeleteFiles(tempDir, "Speaker *.mp3");
+                Logger.tryDeleteFiles(tempDir, "Speaker *.txt");
+                in_item.Status = "Извлечение голосов";
+                setStatus($"🎬 [{in_videoNum}/{in_totalVideos}] {baseName}: извлекаю образцы голосов и пишу txt-референсы...", 0, true);
+                var extracted = await SpeakerAudioExtractor.extractSpeakerAudioAsync(
+                    videoPath, subtitles, TxtFfmpeg.Text.Trim());
+                var voicesFolder = extracted.Count > 0 ? Path.GetDirectoryName(extracted[0]) : tempDir;
+
+                // --- 2. Клонирование и синтез каждой реплики ---
+                var subPath = Path.Combine(videoDir, "subtitlesCache");
+                Logger.tryDeleteFiles(subPath, "*.mp3");
+                Directory.CreateDirectory(subPath);
+                int index = 1;
+                var countAll = speakList.Count();
+                var elapsedMilliseconds = new List<long>();
+                foreach (var sub in speakList)
+                {
+                    var partSw = Stopwatch.StartNew();
+                    in_ct.ThrowIfCancellationRequested();
+                    var outPath = Path.Combine(subPath, $"{index:D3}_subtitlesCache.mp3");
+                    var refAudio = Path.Combine(voicesFolder, $"Speaker {sub.Speaker}.mp3");
+                    var refTextPath = Path.Combine(voicesFolder, $"Speaker {sub.Speaker}.txt");
+                    in_item.Status = $"Озвучка {index}/{speakList.Count}";
+                    if (File.Exists(refAudio))
+                    {
+                        var refText = File.Exists(refTextPath) ? await File.ReadAllTextAsync(refTextPath, in_ct) : null;
+                        await cloneLongTextWithRetryAsync(sub.TranslatedContent, refAudio, refText, outPath, in_ct, MaxTtsChunkLength);
+                    }
+                    else
+                    {
+                        Logger.LogInfo($"{baseName}: для спикера {sub.Speaker} нет образца голоса — синтез голосом default.");
+                        await synthesizeLongTextToFileAsync(sub.TranslatedContent, outPath, "default", in_ct, MaxTtsChunkLength);
+                    }
+
+                    in_item.Progress = Math.Round(100.0 * index / speakList.Count, 1);
+
+                    partSw.Stop();
+                    elapsedMilliseconds.Add(partSw.ElapsedMilliseconds);
+                    if (elapsedMilliseconds.Count > 10)
+                        elapsedMilliseconds.RemoveAt(0);
+                    var avgMill = Convert.ToInt32(elapsedMilliseconds.Sum() / elapsedMilliseconds.Count);
+                    var ostalosMilliseconds = (countAll - index) * avgMill;
+                    var tmpOst = new TimeSpan(0, 0, 0, 0, ostalosMilliseconds);
+                    var fileSize = getStrSizeFile(new FileInfo(outPath).Length);
+                    var duration = AudioProcessor.getAudioDuration(outPath);
+                    var percent = Math.Round(Convert.ToDouble(index) / (Convert.ToDouble(countAll) / 100.0), 3);
+                    var outFileName = System.IO.Path.GetFileNameWithoutExtension(outPath);
+
+                    setStatus($"🎬 [{in_videoNum}/{in_totalVideos}] {baseName}: реплика {index}/{speakList.Count} (спикер {sub.Speaker}). Прошло {videoSw.Elapsed}, примерно осталось {tmpOst}. Прогресс: {percent}% Файл: {outFileName} ({duration} - {fileSize})",
+                        in_item.Progress);
+                    index++;
+                }
+
+                // --- 3. Инструментал (опционально, как в одиночном режиме) ---
+                string instrumental = null;
+                if (ChkUseInstrumentalOnSubtitles.IsChecked == true)
+                {
+                    in_item.Status = "Удаление вокала";
+                    setStatus($"🎬 [{in_videoNum}/{in_totalVideos}] {baseName}: удаление вокала...", 0, true);
+                    if (await removeVocal(videoPath))
+                        instrumental = TxtInstrumental.Text.Trim();
+                }
+
+                // --- 4. Склейка озвучки с видео ---
+                in_item.Status = "Сборка видео";
+                in_item.Progress = 0;
+                var newFileName = $"{baseName} RusAudio.mp4";
+                await speakVideo(subPath, videoPath, newFileName, speakList, instrumental);
+
+                // --- 5. Удаляем временные файлы, готовое видео остаётся ---
+                clearCache(videoPath);
+
+                // --- 6. Тайминги в лог и в таблицу ---
+                videoSw.Stop();
+                double videoDurationSec = 0;
+                try
+                {
+                    videoDurationSec = await getDurationAsync(videoPath, findFfprobe(TxtFfmpeg.Text.Trim()), CancellationToken.None);
+                }
+                catch { /* длительность не критична для лога */ }
+
+                m_totalDubTime += videoSw.Elapsed;
+                m_totalDubbedVideos++;
+
+                in_item.VideoDuration = videoDurationSec > 0 ? formatTimeSpan(TimeSpan.FromSeconds(videoDurationSec)) : "—";
+                in_item.DubTime = formatTimeSpan(videoSw.Elapsed);
+                double k = videoDurationSec > 0 ? videoSw.Elapsed.TotalSeconds / videoDurationSec : 0;
+                in_item.Ratio = k > 0 ? $"1 : {k:F2}" : "—";
+
+                var logMess = $"🎬 [{in_videoNum}/{in_totalVideos}] Видео \"{baseName}\" озвучено за {videoSw.Elapsed} " +
+                              $"(длительность видео {in_item.VideoDuration}, соотношение видео:озвучка = {in_item.Ratio}). " +
+                              $"Суммарное время озвучки всех видео: {formatTimeSpan(m_totalDubTime)} ({m_totalDubbedVideos} шт.).";
+                Logger.LogSuccess(logMess);
+                setStatus($"✅ {logMess}");
+                in_item.Status = "Готово";
+                in_item.Progress = 100;
+            }
+            catch (OperationCanceledException)
+            {
+                in_item.Status = "Прервано";
+                try { clearCache(videoPath); } catch { }
+                throw;
+            }
+            catch (Exception ex)
+            {
+                videoSw.Stop();
+                in_item.Status = "Ошибка";
+                in_item.Error = ex.Message;
+                Logger.LogError($"Видео {baseName}: ошибка дубляжа через {videoSw.Elapsed}: {ex.Message}");
+                setStatus($"❌ Видео {baseName}: ошибка: {ex.Message}");
+                try { clearCache(videoPath); } catch { }
+            }
+        }
+
+        /// <summary>Клонирование длинного текста по кускам (склеивание MP3 — как в остальном синтезе).</summary>
+        private async Task cloneLongTextWithRetryAsync(
+            string in_text, string in_refAudio, string in_refText, string in_outputPath,
+            CancellationToken in_ct, int in_maxChunk = 350)
+        {
+            var chunks = splitTextIntoChunks(in_text, in_maxChunk);
+            if (chunks.Count == 0) return;
+            if (chunks.Count == 1)
+            {
+                await _api.CloneVoiceWithRetryAsync(
+                    chunks[0], in_refAudio, in_refText, "mp3", in_outputPath, in_ct,
+                    onRetry: m => setStatus($"⚠️ Клонирование голоса: {m}", 0, true));
+
+                return;
+            }
+
+            var tempDir = Path.Combine(Path.GetTempPath(), $"clone_chunks_{Guid.NewGuid():N}");
+            Directory.CreateDirectory(tempDir);
+            var files = new List<string>();
+            try
+            {
+                for (int i = 0; i < chunks.Count; i++)
+                {
+                    in_ct.ThrowIfCancellationRequested();
+                    var chunkPath = Path.Combine(tempDir, $"chunk_{i:D4}.mp3");
+                    await _api.CloneVoiceWithRetryAsync(
+                        chunks[i], in_refAudio, in_refText, "mp3", chunkPath, in_ct,
+                        onRetry: m => setStatus($"⚠️ Клонирование голоса (кусок {i + 1}/{chunks.Count}): {m}", 0, true));
+                    files.Add(chunkPath);
+                }
+
+                await concatMp3FilesAsync(files, in_outputPath, in_ct);
+            }
+            finally
+            {
+                try { Directory.Delete(tempDir, true); } catch { }
+            }
+        }
+
+        #endregion
     }
 }

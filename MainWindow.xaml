@@ -578,6 +578,13 @@
                                     Click="onClickSpeakVideo"
                                     Content="Озв. вид."
                                     ToolTip="Озвучить видео с выбранными субтитрами и установленными голосами" />
+                                <Button
+                                    x:Name="BtnBatchSpeakVideos"
+                                    Margin="8"
+                                    Padding="10,6"
+                                    Click="onClickBatchSpeakVideos"
+                                    Content="Озв. пакет"
+                                    ToolTip="🎬 Озвучить пакет видео (JSON и примеры голосов)" />
                             </WrapPanel>
                         </GroupBox>
                     </Expander>
@@ -679,6 +686,98 @@
                         </Border>
                     </Grid>
                 </Grid>
+            </TabItem>
+            <TabItem Header="📤 Таблица дубляжа">
+                <GroupBox
+                    MinHeight="220"
+                    Margin="8"
+                    Header="Очередь дубляжа переводов">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                        </Grid.RowDefinitions>
+
+                        <StackPanel Margin="4" Orientation="Horizontal">
+                            <Button
+                                Margin="0,0,4,0"
+                                Padding="8,4"
+                                Click="onClickAddVideosToDubQueue"
+                                Content="➕ Добавить видео" />
+                            <Button
+                                Margin="0,0,4,0"
+                                Padding="8,4"
+                                Click="onClickAddFolderToDubQueue"
+                                Content="📁 Добавить папку" />
+                            <Button
+                                Margin="0,0,4,0"
+                                Padding="8,4"
+                                Click="onClickStartDubQueue"
+                                Content="▶ Старт очереди" />
+                            <Button
+                                Margin="0,0,4,0"
+                                Padding="8,4"
+                                Click="onClickRemoveSelectedFromDubQueue"
+                                Content="🗑 Убрать выбранное" />
+                            <Button
+                                Margin="0,0,4,0"
+                                Padding="8,4"
+                                Click="onClickClearDubQueue"
+                                Content="❌ Очистить" />
+                        </StackPanel>
+
+                        <DataGrid
+                            x:Name="dgDubQueue"
+                            Grid.Row="1"
+                            Margin="4"
+                            AutoGenerateColumns="False"
+                            CanUserAddRows="False"
+                            IsReadOnly="True"
+                            SelectionMode="Extended">
+                            <DataGrid.Columns>
+                                <DataGridTextColumn
+                                    Width="2*"
+                                    Binding="{Binding VideoPath}"
+                                    Header="Путь к видео" />
+                                <DataGridTextColumn
+                                    Width="2*"
+                                    Binding="{Binding JsonName}"
+                                    Header="JSON перевода" />
+                                <DataGridTextColumn
+                                    Width="1.2*"
+                                    Binding="{Binding Status}"
+                                    Header="Статус" />
+                                <DataGridTemplateColumn Width="100" Header="Прогресс">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <ProgressBar
+                                                Height="14"
+                                                Maximum="100"
+                                                Minimum="0"
+                                                Value="{Binding Progress, Mode=OneWay}" />
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
+                                <DataGridTextColumn
+                                    Width="85"
+                                    Binding="{Binding VideoDuration}"
+                                    Header="Длит. видео" />
+                                <DataGridTextColumn
+                                    Width="95"
+                                    Binding="{Binding DubTime}"
+                                    Header="Время озвучки" />
+                                <DataGridTextColumn
+                                    Width="95"
+                                    Binding="{Binding Ratio}"
+                                    Header="Соотношение" />
+                                <DataGridTextColumn
+                                    Width="2*"
+                                    Binding="{Binding Error}"
+                                    Header="Ошибка" />
+                            </DataGrid.Columns>
+                        </DataGrid>
+                    </Grid>
+                </GroupBox>
             </TabItem>
         </TabControl>
 
