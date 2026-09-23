@@ -672,6 +672,25 @@ namespace SubtitleTranslator
             );
         }
 
+        private const int MaxFfmpegInputsPerCommand = 100;
+
+        private sealed class MixedAudioPart
+        {
+            public string Path { get; set; }
+            public double BaseStartSeconds { get; set; }
+        }
+
+        private sealed class VoicePlan
+        {
+            public int GlobalIndex { get; set; }
+            public double Start { get; set; }
+            public double Slot { get; set; }
+            public double Mp3Duration { get; set; }
+            public double Speed { get; set; }
+            public double FinalDur { get; set; }
+            public bool NeedTrim { get; set; }
+        }
+
         private async Task speakVideo(
             string in_mp3Folder,
             string in_videoPath,
@@ -692,6 +711,8 @@ namespace SubtitleTranslator
             BtnStart.IsEnabled = false;
 
             setStatus($"Парсинг SRT и анализ файлов по видео: {in_videoPath}", 0, true);
+
+            string tempDir = null;
 
             try
             {
@@ -719,29 +740,62 @@ namespace SubtitleTranslator
 
                 double videoDuration = await getDurationAsync(in_videoPath, ffprobePath, _cts.Token);
 
-                string filterComplex = buildFilterComplex(
-                    in_srtBlocks,
-                    mp3Durations,
-                    hasInstrumental,
-                    videoDuration,
-                    in_allowHardTrim: false
-                );
+                // Проверяем не только количество MP3, но и общие входы ffmpeg:
+                // видео + инструментал (если есть) + MP3.
+                // Это нужно, чтобы одна команда не превышала лимит входов.
+                int serviceInputs = 1 + (hasInstrumental ? 1 : 0);
 
-                var arguments = buildFfmpegArgs(
-                    in_videoPath,
-                    mp3Files,
-                    filterComplex,
-                    outputPath,
-                    hasInstrumental ? in_instrumentalPath : null
-                );
+                if (mp3Files.Length + serviceInputs <= MaxFfmpegInputsPerCommand)
+                {
+                    // Старый обычный путь, если входов немного.
+                    string filterComplex = buildFilterComplex(
+                        in_srtBlocks,
+                        mp3Durations,
+                        hasInstrumental,
+                        videoDuration,
+                        in_allowHardTrim: false
+                    );
 
-                setStatus($"Кодирование... (может занять время) по видео: {in_videoPath}", 0, true);
-                await runFfmpegAsync(
-                    ffmpegPath,
-                    arguments,
-                    videoDuration,
-                    _cts.Token
-                );
+                    var arguments = buildFfmpegArgs(
+                        in_videoPath,
+                        mp3Files,
+                        filterComplex,
+                        outputPath,
+                        hasInstrumental ? in_instrumentalPath : null
+                    );
+
+                    setStatus($"Кодирование... (может занять время) по видео: {in_videoPath}", 0, true);
+                    await runFfmpegAsync(
+                        ffmpegPath,
+                        arguments,
+                        videoDuration,
+                        _cts.Token
+                    );
+                }
+                else
+                {
+                    // Если входов слишком много, обрабатываем пачками.
+                    tempDir = Path.Combine(
+                        Path.GetTempPath(),
+                        "speak_video_chunks_" + Guid.NewGuid().ToString("N")
+                    );
+
+                    Directory.CreateDirectory(tempDir);
+
+                    await speakVideoByChunksAsync(
+                        ffmpegPath,
+                        in_videoPath,
+                        outputPath,
+                        in_srtBlocks,
+                        mp3Files,
+                        mp3Durations,
+                        in_instrumentalPath,
+                        hasInstrumental,
+                        videoDuration,
+                        tempDir,
+                        _cts.Token
+                    );
+                }
 
                 clearCache(in_videoPath);
 
@@ -755,14 +809,615 @@ namespace SubtitleTranslator
             }
             catch (Exception ex)
             {
-                setStatus($"❌ Ошибка: {ex.Message}\n    {Logger.getInfoDurationString(dateStart)}:\n    {outputPath}\n  по видео: {in_videoPath}");
-                Logger.LogSuccess($"❌ Ошибка{Logger.getInfoDurationString(dateStart)}: {ex.Message}");
+                var mess = $"❌ Ошибка: {ex.Message}\n    {Logger.getInfoDurationString(dateStart)}:\n    {outputPath}\n  по видео: {in_videoPath}";
+                setStatus(mess);
+                Logger.LogSuccess(mess);
             }
             finally
             {
+                if (!string.IsNullOrWhiteSpace(tempDir))
+                {
+                    try
+                    {
+                        Directory.Delete(tempDir, true);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Временные файлы можно игнорировать, если не удаляются сразу.
+                        Logger.LogError($"Ошибка при удалении файлов из временной {tempDir} папки {ex.Message}");
+                    }
+                }
+
                 BtnStart.IsEnabled = true;
                 PbProgress.IsIndeterminate = false;
             }
+        }
+
+        private async Task speakVideoByChunksAsync(
+            string in_ffmpegPath,
+            string in_videoPath,
+            string in_outputPath,
+            List<SubtitleItem> in_srtBlocks,
+            string[] in_mp3Files,
+            List<double> in_mp3Durations,
+            string in_instrumentalPath,
+            bool in_hasInstrumental,
+            double in_videoDuration,
+            string in_tempDir,
+            CancellationToken in_ct)
+        {
+            var plans = buildVoicePlans(
+                in_srtBlocks,
+                in_mp3Durations,
+                in_videoDuration,
+                in_allowHardTrim: false
+            );
+
+            if (plans.Count == 0)
+            {
+                // На практике сюда не должны попадать, потому что без озвучки
+                // отработает обычный путь, но оставим безопасный fallback.
+                string filterComplex = buildFilterComplex(
+                    in_srtBlocks,
+                    in_mp3Durations,
+                    in_hasInstrumental,
+                    in_videoDuration,
+                    in_allowHardTrim: false
+                );
+
+                var arguments = buildFfmpegArgs(
+                    in_videoPath,
+                    new string[0],
+                    filterComplex,
+                    in_outputPath,
+                    in_hasInstrumental ? in_instrumentalPath : null
+                );
+
+                await runFfmpegAsync(
+                    in_ffmpegPath,
+                    arguments,
+                    in_videoDuration,
+                    in_ct
+                );
+
+                return;
+            }
+
+            var voiceParts = new List<MixedAudioPart>();
+
+            int chunkSize = MaxFfmpegInputsPerCommand;
+            int chunkIndex = 0;
+
+            // Шаг 1: режем голосовые файлы на пачки максимум по 100 штук
+            // и каждую пачку сводим во временную WAV-дорожку.
+            for (int offset = 0; offset < plans.Count; offset += chunkSize)
+            {
+                in_ct.ThrowIfCancellationRequested();
+
+                int count = Math.Min(chunkSize, plans.Count - offset);
+
+                var chunkFiles = in_mp3Files
+                    .Skip(offset)
+                    .Take(count)
+                    .ToArray();
+
+                double baseStart = plans
+                    .Skip(offset)
+                    .Take(count)
+                    .Min(p => p.Start);
+
+                setStatus(
+                    $"Кодирование голосовой пачки {chunkIndex + 1} ({count} из {plans.Count})... по видео: {in_videoPath}",
+                    0,
+                    true
+                );
+
+                string filter = buildVoiceChunkFilter(
+                    plans,
+                    offset,
+                    count,
+                    baseStart
+                );
+
+                string chunkPath = Path.Combine(
+                    in_tempDir,
+                    $"voice_chunk_{chunkIndex:0000}.wav"
+                );
+
+                var arguments = buildAudioOnlyMixArgs(
+                    chunkFiles,
+                    filter,
+                    chunkPath
+                );
+
+                await runFfmpegAsync(
+                    in_ffmpegPath,
+                    arguments,
+                    in_videoDuration,
+                    in_ct
+                );
+
+                voiceParts.Add(new MixedAudioPart
+                {
+                    Path = chunkPath,
+                    BaseStartSeconds = baseStart
+                });
+
+                chunkIndex++;
+            }
+
+            // Шаг 2: если пачек получилось слишком много для финальной команды,
+            // укрупняем их, чтобы финальный ffmpeg тоже не получил больше 100 входов.
+            int maxPreparedVoicesInFinal = Math.Max(
+                1,
+                MaxFfmpegInputsPerCommand - (1 + (in_hasInstrumental ? 1 : 0))
+            );
+
+            voiceParts = await reduceVoicePartsAsync(
+                voiceParts,
+                maxPreparedVoicesInFinal,
+                in_tempDir,
+                in_ffmpegPath,
+                in_videoDuration,
+                in_ct
+            );
+
+            // Шаг 3: финальная сборка видео + фон + подготовленные голосовые пачки.
+            setStatus(
+                $"Финальное сведение ({voiceParts.Count} подготовленных дорожек)... по видео: {in_videoPath}",
+                0,
+                true
+            );
+
+            string finalFilter = buildFinalFilterWithPreparedVoices(
+                plans,
+                voiceParts,
+                in_hasInstrumental
+            );
+
+            var finalArguments = buildFfmpegArgs(
+                in_videoPath,
+                voiceParts.Select(p => p.Path).ToArray(),
+                finalFilter,
+                in_outputPath,
+                in_hasInstrumental ? in_instrumentalPath : null
+            );
+
+            await runFfmpegAsync(
+                in_ffmpegPath,
+                finalArguments,
+                in_videoDuration,
+                in_ct
+            );
+        }
+
+        private List<VoicePlan> buildVoicePlans(
+            List<SubtitleItem> in_blocks,
+            List<double> in_mp3Durations,
+            double in_videoDuration,
+            bool in_allowHardTrim)
+        {
+            const double maxSpeed = 1.5;
+
+            int voiceCount = Math.Min(in_blocks.Count, in_mp3Durations.Count);
+            var result = new List<VoicePlan>(voiceCount);
+
+            for (int i = 0; i < voiceCount; i++)
+            {
+                double start = Math.Max(0, in_blocks[i].StartTime.TotalSeconds);
+                double srtEnd = Math.Max(start + 0.05, in_blocks[i].EndTime.TotalSeconds);
+
+                double limitEnd = srtEnd;
+
+                if (i + 1 < in_blocks.Count)
+                {
+                    double nextStart = in_blocks[i + 1].StartTime.TotalSeconds;
+
+                    if (nextStart > start + 0.05)
+                    {
+                        // Жёсткая граница до начала следующей реплики.
+                        // Это защищает от наложения, но может вызывать обрезку,
+                        // если текущая озвучка слишком длинная.
+                        limitEnd = nextStart;
+                    }
+                }
+                else if (in_videoDuration > start + 0.05)
+                {
+                    // Для последнего блока можно разрешить звучать до конца видео,
+                    // чтобы последняя длинная фраза не резалась о EndTime субтитра.
+                    limitEnd = Math.Max(srtEnd, in_videoDuration);
+                }
+
+                double slot = Math.Max(0.05, limitEnd - start);
+                double mp3Dur = Math.Max(0, in_mp3Durations[i]);
+
+                double speed = 1.0;
+
+                if (mp3Dur > slot)
+                {
+                    double needed = mp3Dur / slot;
+                    speed = Math.Min(maxSpeed, Math.Ceiling(needed * 1000.0) / 1000.0);
+
+                    if (speed < 1.0)
+                        speed = 1.0;
+                }
+
+                double finalDur = mp3Dur > 0 ? mp3Dur / speed : 0;
+
+                bool tooLong = finalDur > slot + 0.03;
+                bool needTrim = tooLong && in_allowHardTrim;
+
+                if (needTrim)
+                    finalDur = slot;
+
+                if (finalDur <= 0.01)
+                    finalDur = Math.Min(slot, 0.1);
+
+                if (tooLong)
+                {
+                    Logger.LogInfo(
+                        $"⚠️ Блок {i + 1}: MP3 = {mp3Dur:F2}s, окно = {slot:F2}s, " +
+                        $"скорость = {speed:F2}x, после ускорения = {finalDur:F2}s. " +
+                        (needTrim
+                            ? "Обрезка включена: хвост будет срезан."
+                            : "Обрезка отключена: возможно наложение на следующую реплику."));
+                }
+
+                result.Add(new VoicePlan
+                {
+                    GlobalIndex = i,
+                    Start = start,
+                    Slot = slot,
+                    Mp3Duration = mp3Dur,
+                    Speed = speed,
+                    FinalDur = finalDur,
+                    NeedTrim = needTrim
+                });
+            }
+
+            return result;
+        }
+
+        private string buildVoiceChunkFilter(
+            List<VoicePlan> in_plans,
+            int in_offset,
+            int in_count,
+            double in_baseStart)
+        {
+            var voiceParts = new List<string>();
+            var labels = new List<string>();
+
+            for (int local = 0; local < in_count; local++)
+            {
+                int global = in_offset + local;
+                var p = in_plans[global];
+
+                // Чтобы не писать огромные файлы с тишиной от начала видео,
+                // внутри пачки делаем задержку относительно базы этой пачки.
+                // Финальный фильтр снова вернёт абсолютную задержку.
+                double delaySec = Math.Max(0, p.Start - in_baseStart);
+                int delayMs = (int)Math.Round(delaySec * 1000.0, MidpointRounding.AwayFromZero);
+
+                string label = $"v{local}";
+                labels.Add(label);
+
+                string trimFilter = string.Empty;
+
+                if (p.NeedTrim)
+                {
+                    double fadeStart = Math.Max(0, p.Slot - 0.08);
+
+                    trimFilter =
+                        $",atrim=end={p.Slot.ToString("0.000", CultureInfo.InvariantCulture)}" +
+                        $",asetpts=PTS-STARTPTS" +
+                        $",afade=t=out:st={fadeStart.ToString("0.000", CultureInfo.InvariantCulture)}:d=0.08";
+                }
+
+                voiceParts.Add(
+                    $"[{local}:a]" +
+                    $"aformat=channel_layouts=stereo," +
+                    $"atempo={p.Speed.ToString("0.000", CultureInfo.InvariantCulture)}" +
+                    trimFilter +
+                    $",adelay={delayMs}|{delayMs}" +
+                    $"[{label}]"
+                );
+            }
+
+            if (labels.Count == 0)
+                throw new InvalidOperationException("Пустой блок голосов для пакетной обработки.");
+
+            if (labels.Count == 1)
+                return voiceParts[0].Replace($"[{labels[0]}]", "[a_out]");
+
+            string inputs = string.Join("", labels.Select(l => $"[{l}]"));
+
+            voiceParts.Add(
+                $"{inputs}amix=inputs={labels.Count}:duration=longest:normalize=0[a_out]"
+            );
+
+            return string.Join(";", voiceParts);
+        }
+
+        private async Task<List<MixedAudioPart>> reduceVoicePartsAsync(
+            List<MixedAudioPart> in_parts,
+            int in_maxParts,
+            string in_tempDir,
+            string in_ffmpegPath,
+            double in_videoDuration,
+            CancellationToken in_ct)
+        {
+            int level = 0;
+
+            while (in_parts.Count > in_maxParts)
+            {
+                in_ct.ThrowIfCancellationRequested();
+
+                setStatus(
+                    $"Укрупнение промежуточных дорожек (уровень {level + 1}, дорожек: {in_parts.Count})...",
+                    0,
+                    true
+                );
+
+                var next = new List<MixedAudioPart>();
+
+                if (in_parts.Count <= MaxFfmpegInputsPerCommand)
+                {
+                    var mixed = await mixAudioPartsAsync(
+                        in_parts,
+                        in_tempDir,
+                        in_ffmpegPath,
+                        $"mix_level_{level:0000}",
+                        in_videoDuration,
+                        in_ct
+                    );
+
+                    next.Add(mixed);
+                }
+                else
+                {
+                    int step = Math.Max(2, Math.Min(MaxFfmpegInputsPerCommand, in_parts.Count));
+                    int batchIndex = 0;
+
+                    for (int i = 0; i < in_parts.Count; i += step)
+                    {
+                        var batch = in_parts
+                            .Skip(i)
+                            .Take(step)
+                            .ToList();
+
+                        if (batch.Count == 1)
+                        {
+                            next.Add(batch[0]);
+                        }
+                        else
+                        {
+                            var mixed = await mixAudioPartsAsync(
+                                batch,
+                                in_tempDir,
+                                in_ffmpegPath,
+                                $"mix_level_{level:0000}_batch_{batchIndex:0000}",
+                                in_videoDuration,
+                                in_ct
+                            );
+
+                            next.Add(mixed);
+                        }
+
+                        batchIndex++;
+                    }
+                }
+
+                if (next.Count == in_parts.Count)
+                    throw new Exception("Не удалось уменьшить количество промежуточных аудиофайлов.");
+
+                in_parts = next;
+                level++;
+            }
+
+            return in_parts;
+        }
+
+        private async Task<MixedAudioPart> mixAudioPartsAsync(
+            List<MixedAudioPart> in_parts,
+            string in_tempDir,
+            string in_ffmpegPath,
+            string in_name,
+            double in_videoDuration,
+            CancellationToken in_ct)
+        {
+            if (in_parts.Count == 0)
+                throw new InvalidOperationException("Нет аудиофайлов для промежуточного сведения.");
+
+            double groupBase = in_parts.Min(p => p.BaseStartSeconds);
+
+            string filter = buildMixPartsFilter(in_parts, groupBase);
+
+            string outPath = Path.Combine(
+                in_tempDir,
+                $"{in_name}.wav"
+            );
+
+            var inputFiles = in_parts.Select(p => p.Path).ToArray();
+
+            var arguments = buildAudioOnlyMixArgs(
+                inputFiles,
+                filter,
+                outPath
+            );
+
+            await runFfmpegAsync(
+                in_ffmpegPath,
+                arguments,
+                in_videoDuration,
+                in_ct
+            );
+
+            return new MixedAudioPart
+            {
+                Path = outPath,
+                BaseStartSeconds = groupBase
+            };
+        }
+
+        private string buildMixPartsFilter(
+            List<MixedAudioPart> in_parts,
+            double in_groupBase)
+        {
+            var voiceParts = new List<string>();
+            var labels = new List<string>();
+
+            for (int i = 0; i < in_parts.Count; i++)
+            {
+                double delaySec = Math.Max(0, in_parts[i].BaseStartSeconds - in_groupBase);
+                int delayMs = (int)Math.Round(delaySec * 1000.0, MidpointRounding.AwayFromZero);
+
+                string label = $"m{i}";
+                labels.Add(label);
+
+                voiceParts.Add(
+                    $"[{i}:a]" +
+                    $"aformat=channel_layouts=stereo," +
+                    $"adelay={delayMs}|{delayMs}" +
+                    $"[{label}]"
+                );
+            }
+
+            if (labels.Count == 0)
+                throw new InvalidOperationException("Пустой список промежуточных аудиофайлов.");
+
+            if (labels.Count == 1)
+                return voiceParts[0].Replace($"[{labels[0]}]", "[a_out]");
+
+            string inputs = string.Join("", labels.Select(l => $"[{l}]"));
+
+            voiceParts.Add(
+                $"{inputs}amix=inputs={labels.Count}:duration=longest:normalize=0[a_out]"
+            );
+
+            return string.Join(";", voiceParts);
+        }
+
+        private string buildFinalFilterWithPreparedVoices(
+            List<VoicePlan> in_plans,
+            List<MixedAudioPart> in_voiceParts,
+            bool in_hasInstrumental)
+        {
+            var windows = new List<(double Start, double End)>();
+
+            foreach (var p in in_plans)
+                windows.Add((p.Start, p.Start + p.FinalDur));
+
+            string timeline = buildTimelineExpression(windows);
+
+            int voiceInputStart = in_hasInstrumental ? 2 : 1;
+            int voiceCount = in_voiceParts.Count;
+
+            var parts = new List<string>();
+
+            if (in_hasInstrumental)
+            {
+                // Если есть озвучка, инструментал внутри субтитров делаем потише,
+                // чтобы голос был разборчивее.
+                // Если озвучки нет, оставляем почти полную громкость.
+                double instrumentalVolume = voiceCount > 0 ? 0.85 : 1;
+
+                // Оригинальная дорожка:
+                // внутри субтитров молчит, вне субтитров звучит как есть.
+                parts.Add($"[0:a]volume=0:enable='{timeline}'[a_orig_part]");
+
+                // Инструментал:
+                // вне субтитров молчит, внутри субтитров звучит.
+                parts.Add(
+                    $"[1:a]volume=0:enable='not({timeline}')," +
+                    $"volume={instrumentalVolume.ToString("0.00", CultureInfo.InvariantCulture)}:enable='{timeline}'" +
+                    $"[a_inst_part]"
+                );
+
+                // Смешиваем оригинал вне субтитров и инструментал внутри субтитров.
+                parts.Add("[a_orig_part][a_inst_part]amix=inputs=2:duration=longest:normalize=0[a_bg]");
+            }
+            else
+            {
+                // Если инструментала нет, ведём себя близко к старой логике:
+                // оригинал тихо, если есть озвучка.
+                if (voiceCount == 0)
+                    parts.Add("[0:a]anull[a_bg]");
+                else
+                    parts.Add("[0:a]volume=0.03[a_bg]");
+            }
+
+            var labels = new List<string>();
+
+            for (int i = 0; i < in_voiceParts.Count; i++)
+            {
+                string label = $"v{i}";
+                labels.Add(label);
+
+                int delayMs = (int)Math.Round(
+                    Math.Max(0, in_voiceParts[i].BaseStartSeconds) * 1000.0,
+                    MidpointRounding.AwayFromZero
+                );
+
+                parts.Add(
+                    $"[{voiceInputStart + i}:a]" +
+                    $"aformat=channel_layouts=stereo," +
+                    $"adelay={delayMs}|{delayMs}" +
+                    $"[{label}]"
+                );
+            }
+
+            if (labels.Count > 1)
+            {
+                string inputs = string.Join("", labels.Select(l => $"[{l}]"));
+
+                parts.Add(
+                    $"{inputs}amix=inputs={labels.Count}:duration=longest:normalize=0[a_voice]"
+                );
+
+                parts.Add("[a_bg][a_voice]amix=inputs=2:duration=longest:normalize=0[a_out]");
+            }
+            else if (labels.Count == 1)
+            {
+                parts.Add($"[a_bg][{labels[0]}]amix=inputs=2:duration=longest:normalize=0[a_out]");
+            }
+            else
+            {
+                parts.Add("[a_bg]anull[a_out]");
+            }
+
+            return string.Join(";", parts);
+        }
+
+        private List<string> buildAudioOnlyMixArgs(
+            string[] in_inputFiles,
+            string in_filter,
+            string in_output)
+        {
+            var args = new List<string> { "-y" };
+
+            foreach (var file in in_inputFiles)
+            {
+                args.Add("-i");
+                args.Add(file);
+            }
+
+            args.Add("-filter_complex");
+            args.Add(in_filter);
+
+            args.Add("-map");
+            args.Add("[a_out]");
+
+            args.Add("-vn");
+
+            // Промежуточный несжатый аудиофайл.
+            // Если захотите максимальный запас по качеству/громкости,
+            // можно заменить pcm_s16le на pcm_f32le.
+            args.Add("-c:a");
+            args.Add("pcm_s16le");
+
+            args.Add(in_output);
+
+            return args;
         }
 
         private void clearCache(string in_videoPath)
